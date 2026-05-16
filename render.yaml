@@ -1,0 +1,30 @@
+services:
+  # Backend Service (FastAPI)
+  - type: web
+    name: safeguard-ai-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.api.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DATABASE_URL
+        sync: false # Set manually in Render Dashboard to your Supabase URL
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ADMIN_USERNAME
+        value: Sohaib
+      - key: ADMIN_PASSWORD
+        sync: false
+
+  # Frontend Service (Streamlit)
+  - type: web
+    name: safeguard-ai-frontend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run frontend/App.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: SAFEGUARD_API_BASE_URL
+        fromService:
+          name: safeguard-ai-backend
+          property: host

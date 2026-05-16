@@ -1,0 +1,40 @@
+# Core
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic-settings==2.5.2
+python-dotenv==1.2.2
+
+# Database
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.9
+python-multipart==0.0.12
+alembic==1.13.2
+
+# Security
+python-jose[cryptography]==3.3.0
+bcrypt==4.2.1
+
+# AI & ML
+groq==0.11.0
+joblib==1.4.2
+numpy==2.1.1
+pandas==2.2.3
+scikit-learn==1.5.2
+shap==0.46.0
+httpx==0.27.2
+
+# Networking
+scapy==2.5.0
+pyshark==0.6
+dnspython==2.6.1
+python-whois==0.8.0
+
+# Frontend (for reference)
+streamlit==1.39.0
+matplotlib==3.9.2
+requests==2.32.3
+pyyaml==6.0.2
+
+# Added for Deep Scanner Modules
+cryptography
+aiofiles
