@@ -36,7 +36,7 @@ st.set_page_config(
     page_title="Safeguard-AI Lite",
     page_icon="shield",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 logger = configure_logger("safeguard.frontend", "logs/frontend.log")
 
@@ -67,6 +67,9 @@ def init_state() -> None:
     # Active scanner state
     st.session_state.setdefault("scan_result", None)
     st.session_state.setdefault("scan_target", "")
+    st.session_state.setdefault("auth_role", "user")
+    st.session_state.setdefault("onboarding_done", True)
+    st.session_state.setdefault("just_registered", False)
 
 
 def serialize_live_history(history: list[dict]) -> list[dict]:
@@ -258,25 +261,33 @@ def render_live_dashboard(
                 .unstack(fill_value=0)
                 .sort_index()
             )
-            if len(grouped) >= 2:
-                st.line_chart(grouped)
-            elif len(grouped) == 1:
-                # Only one time point — use matplotlib bar chart with integer Y-axis
+            if not grouped.empty:
                 colors_map = {"Normal": "#34d399", "BruteForce": "#38bdf8",
-                              "DDoS": "#fb7185", "PortScan": "#fbbf24"}
+                              "DDoS": "#fb7185", "PortScan": "#fbbf24",
+                              "Attack": "#fb7185"}
+                x_labels = [t.strftime("%H:%M:%S") for t in grouped.index]
+                cols = list(grouped.columns)
                 fig, ax = plt.subplots(figsize=(6, 4))
                 fig.patch.set_facecolor("#0f172a")
                 ax.set_facecolor("#111827")
-                x_labels = [t.strftime("%H:%M:%S") for t in grouped.index]
-                bar_width = 0.25
-                cols = list(grouped.columns)
-                for i, col in enumerate(cols):
-                    offset = (i - len(cols)/2 + 0.5) * bar_width
-                    positions = [j + offset for j in range(len(x_labels))]
-                    ax.bar(positions, grouped[col], width=bar_width,
-                           label=col, color=colors_map.get(col, "#a78bfa"))
-                ax.set_xticks(range(len(x_labels)))
-                ax.set_xticklabels(x_labels, color="#e2e8f0")
+                if len(grouped) >= 2:
+                    x_pos = range(len(x_labels))
+                    for col in cols:
+                        ax.plot(list(x_pos), grouped[col].tolist(),
+                                label=col, color=colors_map.get(col, "#a78bfa"),
+                                linewidth=2, marker="o", markersize=4)
+                    ax.set_xticks(list(x_pos))
+                    ax.set_xticklabels(x_labels, rotation=30, ha="right",
+                                       color="#e2e8f0", fontsize=8)
+                else:
+                    bar_width = 0.25
+                    for i, col in enumerate(cols):
+                        offset = (i - len(cols)/2 + 0.5) * bar_width
+                        positions = [j + offset for j in range(len(x_labels))]
+                        ax.bar(positions, grouped[col], width=bar_width,
+                               label=col, color=colors_map.get(col, "#a78bfa"))
+                    ax.set_xticks(range(len(x_labels)))
+                    ax.set_xticklabels(x_labels, color="#e2e8f0")
                 ax.yaxis.set_major_locator(MaxNLocator(integer=True))
                 ax.set_ylabel("Count", color="#94a3b8")
                 ax.set_title("2-Second Event Timeline", color="#e2e8f0", pad=10)
@@ -293,75 +304,251 @@ def render_live_dashboard(
                 st.info("Accumulating data…")
 
 
+
 def render_login() -> None:
     auth_token = st.session_state.get("auth_token")
     auth_user  = st.session_state.get("auth_user")
+    auth_role  = st.session_state.get("auth_role", "user")
 
+    # ── Already signed in ────────────────────────────────────────────────────
     if auth_token and auth_user:
-        st.success(f"✅ You are signed in as **{auth_user}**.")
-        st.info("You now have full access to all tabs and sidebar tools.")
+        role_badge = "🔴 Admin" if auth_role == "admin" else "🟢 User"
+        st.success(f"✅ You are signed in as **{auth_user}** — {role_badge}")
+        st.info("You have full access to all security tools and services.")
         if st.button("🚪 Sign Out", type="secondary"):
-            st.session_state["auth_token"]       = None
-            st.session_state["auth_user"]        = None
-            st.session_state["model_info_cache"] = None
+            for _k in ["auth_token", "auth_user", "model_info_cache"]:
+                st.session_state[_k] = None
+            st.session_state["auth_role"] = "user"
             st.rerun()
         return
 
-    st.subheader("Login")
-    st.caption("Authenticate to access protected dashboard features.")
+    # ── Not signed in — two-tab layout ───────────────────────────────────────
+    tab_login, tab_signup = st.tabs(["🔑 Sign In", "📝 Sign Up"])
 
-    col_form, col_help = st.columns([1, 1])
-    with col_form:
-        with st.container(border=True):
-            st.markdown("**Sign In or Create Account**")
-            username = st.text_input("Username", key="login_username", placeholder="e.g. admin")
-            password = st.text_input("Password", type="password", key="login_password", placeholder="Your password")
-            c1, c2 = st.columns(2)
-            with c1:
-                if st.button("Sign In", type="primary", use_container_width=True):
+    # ════ TAB 1 : SIGN IN ═══════════════════════════════════════════════════
+    with tab_login:
+        col_form, col_help = st.columns([1, 1])
+        with col_form:
+            with st.container(border=True):
+                st.markdown("#### Sign In")
+                username = st.text_input(
+                    "Username", key="login_username", placeholder="e.g. admin")
+                password = st.text_input(
+                    "Password", type="password",
+                    key="login_password", placeholder="Your password")
+                sign_in_btn = st.button(
+                    "Sign In", type="primary",
+                    use_container_width=True, key="signin_btn")
+
+                # Enter-key with iOS Safari fallback
+                components.html("""
+                <script>
+                function setupKeyHandlers() {
+                  var doc = window.parent.document;
+                  var inputs = Array.from(
+                    doc.querySelectorAll('input[type="text"], input[type="password"]')
+                  ).filter(function(i) {
+                    return i.offsetParent !== null;
+                  });
+
+                  inputs.forEach(function(inp, idx) {
+                    inp.removeEventListener('keydown', inp._kd_handler);
+                    inp.removeEventListener('keyup',   inp._ku_handler);
+
+                    inp._kd_handler = function(e) {
+                      if (e.key === 'Enter' || e.keyCode === 13) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        var next = inputs[idx + 1];
+                        if (next && next.type === 'password') {
+                          next.focus();
+                          next.click();
+                        } else if (!next || idx === inputs.length - 1) {
+                          var btns = Array.from(
+                            doc.querySelectorAll('button[kind="primary"]')
+                          ).filter(function(b) { return b.offsetParent !== null; });
+                          if (btns.length > 0) btns[0].click();
+                        }
+                      }
+                    };
+
+                    inp._ku_handler = function(e) {
+                      if ((e.key === 'Enter' || e.keyCode === 13)
+                           && inp.type === 'password') {
+                        var btns = Array.from(
+                          doc.querySelectorAll('button[kind="primary"]')
+                        ).filter(function(b) { return b.offsetParent !== null; });
+                        if (btns.length > 0) btns[0].click();
+                      }
+                    };
+
+                    inp.addEventListener('keydown', inp._kd_handler);
+                    inp.addEventListener('keyup',   inp._ku_handler);
+
+                    inp.setAttribute('inputmode',
+                      inp.type === 'password' ? 'text' : 'text');
+                    inp.setAttribute('enterkeyhint',
+                      idx < inputs.length - 1 ? 'next' : 'done');
+                    inp.setAttribute('autocomplete',
+                      inp.type === 'password' ? 'current-password' : 'username');
+                  });
+                }
+
+                setTimeout(setupKeyHandlers, 300);
+                setTimeout(setupKeyHandlers, 800);
+                </script>
+                """, height=0)
+
+                if sign_in_btn:
                     if not username or not password:
                         st.error("Please enter both username and password.")
                     else:
-                        result, err = run_api_call(get_client().login, username=username, password=password)
+                        result, err = run_api_call(
+                            get_client().login,
+                            username=username, password=password)
                         if err:
                             render_api_error(err)
                         elif result is None:
-                            st.error("❌ Cannot reach backend. Run: `uvicorn backend.api.main:app --reload`")
+                            st.error(
+                                "❌ Cannot reach backend. "
+                                "Wait 1 minute and try again.")
                         elif "access_token" in result:
-                            st.session_state["auth_token"] = result["access_token"]
-                            st.session_state["auth_user"]  = result.get("username", username)
-                            st.success("✅ Login successful!")
+                            st.session_state["auth_token"] = \
+                                result["access_token"]
+                            st.session_state["auth_user"] = \
+                                result.get("username", username)
+                            _admin_names = [
+                                n.strip() for n in
+                                os.environ.get(
+                                    "ADMIN_USERNAMES", "admin"
+                                ).split(",")
+                            ]
+                            st.session_state["auth_role"] = (
+                                "admin"
+                                if username in _admin_names
+                                else "user"
+                            )
+                            # Show tour only for newly registered accounts
+                            if st.session_state.get("just_registered", False):
+                                st.session_state["onboarding_done"] = False
+                                st.session_state["just_registered"] = False
+                            st.success("✅ Signed in successfully!")
                             st.rerun()
                         else:
-                            st.error(f"Login failed: {result.get('detail', 'Invalid credentials')}")
-            with c2:
-                if st.button("Create Admin", use_container_width=True):
-                    if not username or not password:
-                        st.error("Enter username and password first.")
+                            st.error(
+                                f"Login failed: "
+                                f"{result.get('detail', 'Invalid credentials')}")
+
+        with col_help:
+            with st.container(border=True):
+                st.markdown("**ℹ️ First time here?**")
+                st.markdown("""
+1. Go to the **Sign Up** tab
+2. Create your account
+3. Come back here and **Sign In**
+                """)
+                st.info(
+                    "⏳ **Backend loading?** "
+                    "Wait up to **1 minute** then try again.")
+
+    # ════ TAB 2 : SIGN UP ═══════════════════════════════════════════════════
+    with tab_signup:
+        col_su, col_su_help = st.columns([1, 1])
+        with col_su:
+            with st.container(border=True):
+                st.markdown("#### Create Account")
+                new_user = st.text_input(
+                    "Username", key="signup_username",
+                    placeholder="Choose a username")
+                new_pass = st.text_input(
+                    "Password", type="password",
+                    key="signup_password",
+                    placeholder="Choose a password")
+                confirm_pass = st.text_input(
+                    "Confirm Password", type="password",
+                    key="signup_confirm",
+                    placeholder="Repeat your password")
+                create_btn = st.button(
+                    "Create Account", type="primary",
+                    use_container_width=True, key="create_account_btn")
+
+                # Enter on confirm password → click Create Account (iOS compatible)
+                components.html("""
+                <script>
+                function setupSignupKeys() {
+                  var doc = window.parent.document;
+                  var allInputs = Array.from(
+                    doc.querySelectorAll('input[type="password"]')
+                  ).filter(function(i) { return i.offsetParent !== null; });
+                  var lastPass = allInputs[allInputs.length - 1];
+                  if (lastPass) {
+                    lastPass.removeEventListener('keydown', lastPass._kd_handler);
+                    lastPass.removeEventListener('keyup',   lastPass._ku_handler);
+
+                    lastPass._kd_handler = function(e) {
+                      if (e.key === 'Enter' || e.keyCode === 13) {
+                        e.preventDefault();
+                        var btns = Array.from(
+                          doc.querySelectorAll('button[kind="primary"]')
+                        ).filter(function(b) { return b.offsetParent !== null; });
+                        btns.forEach(function(b) {
+                          if (b.innerText.trim().toLowerCase().includes('create'))
+                            b.click();
+                        });
+                      }
+                    };
+                    lastPass._ku_handler = lastPass._kd_handler;
+
+                    lastPass.addEventListener('keydown', lastPass._kd_handler);
+                    lastPass.addEventListener('keyup',   lastPass._ku_handler);
+                    lastPass.setAttribute('enterkeyhint', 'done');
+                    lastPass.setAttribute('autocomplete', 'new-password');
+                  }
+                }
+                setTimeout(setupSignupKeys, 300);
+                setTimeout(setupSignupKeys, 800);
+                </script>
+                """, height=0)
+
+                if create_btn:
+                    if not new_user or not new_pass:
+                        st.error("Please fill in all fields.")
+                    elif new_pass != confirm_pass:
+                        st.error("❌ Passwords do not match.")
+                    elif len(new_pass) < 6:
+                        st.error(
+                            "Password must be at least 6 characters.")
                     else:
-                        result, err = run_api_call(get_client().create_admin, username=username, password=password)
+                        result, err = run_api_call(
+                            get_client().create_admin,
+                            username=new_user, password=new_pass)
                         if err:
                             render_api_error(err)
                         elif result is None:
-                            st.error("❌ Cannot reach backend.")
+                            st.error(
+                                "❌ Cannot reach backend. "
+                                "Wait 1 minute and try again.")
                         else:
-                            st.success("✅ Admin created! Now click **Sign In**.")
+                            st.session_state["just_registered"] = True
+                            st.success(
+                                "✅ Account created! "
+                                "Go to **Sign In** tab to log in.")
 
-    with col_help:
-        with st.container(border=True):
-            st.markdown("**ℹ️ First time here?**")
-            st.markdown("""
-1. Enter any username & password  
-2. Click **Create Admin**  
-3. Click **Sign In**
-
-**Backend not running?**  
-Open a terminal and run:
-```
-uvicorn backend.api.main:app --reload
-```
-Then refresh this page.
-            """)
+        with col_su_help:
+            with st.container(border=True):
+                st.markdown("**✅ What you get with an account:**")
+                st.markdown("""
+- 🔍 Full Deep Security Scanner
+- 🎯 Active Scanner (any IP / domain)
+- 📡 Live Attack Simulations
+- 📊 Statistics & Analytics
+- 🖥️ SOC Dashboard
+- 🤖 SOC AI Assistant
+- 🛡️ Security Center
+                """)
+                st.info(
+                    "All new accounts have **full service access**. "
+                    "No restrictions on scanning or analysis tools.")
 
 
 
@@ -385,11 +572,10 @@ def render_home() -> None:
 
 | Step | What to Do | Where |
 |------|-----------|-------|
-| 1 | Start the backend server | Terminal: `uvicorn backend.api.main:app --reload` |
-| 2 | Create an account & sign in | **Login** tab (above) |
-| 3 | Scan an IP or website | Sidebar → **Deep Security Scanner** |
-| 4 | Simulate attacks with AI | **Live Predictions** tab |
-| 5 | View all your results | **Statistics** tab |
+| 1 | Create an account & sign in | **Login** tab (above) |
+| 2 | Scan an IP or website | Sidebar → **Deep Security Scanner** |
+| 3 | Simulate attacks with AI | **Live Predictions** tab |
+| 4 | View all your results | **Statistics** tab |
         """)
 
     model_info = fetch_model_info()
@@ -397,10 +583,13 @@ def render_home() -> None:
         run_api_call(get_client().stats) if st.session_state.get("auth_token") else (None, None)
     )
 
-    if not model_info:
-        st.warning("⚠️ **Backend not connected.** Start it with: `uvicorn backend.api.main:app --reload --port 8000`")
+    if st.session_state.get("auth_token"):
+        if not model_info:
+            st.warning("⚠️ **Backend not reachable.** Please wait a moment and refresh the page.")
+        else:
+            st.success("✅ Backend connected — model loaded and ready.")
     else:
-        st.success("✅ Backend connected — model loaded and ready.")
+        st.info("🔒 Sign in from the **Login** tab to see backend status and model information.")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Model", model_info.get("model_name", "Unavailable") if model_info else "Unavailable")
@@ -1052,11 +1241,9 @@ def render_soc_dashboard() -> None:
 
     api_base_url = st.session_state["api_base_url"]
     token = st.session_state.get("auth_token") or ""
-    if not token:
-        st.warning("🔒 Sign in from the **Login** tab to enable alert acknowledgement and secure analyst notifications.")
 
-    st.info("ℹ️ The WebSocket feed connects live to the backend. If the backend is not running, **Demo Mode** activates automatically and simulates realistic SOC activity.")
 
+    _role = st.session_state.get("auth_role", "user")
     html = """
     <div style="font-family: 'Segoe UI', sans-serif; color: #e2e8f0; background:#0f172a; padding:18px; border-radius:18px;">
       <style>
@@ -1077,6 +1264,26 @@ def render_soc_dashboard() -> None:
         .status-disconnected { color:#f59e0b; font-weight:700; }
         .status-demo { color:#a78bfa; font-weight:700; }
         .demo-banner { background: rgba(167,139,250,0.08); border:1px solid rgba(167,139,250,0.3); border-radius:10px; padding:10px 14px; margin-bottom:12px; font-size:0.85rem; color:#a78bfa; }
+        @media (max-width: 600px) {
+          .soc-box { padding: 10px; border-radius: 10px; overflow: hidden; word-break: break-word; }
+          .soc-title { font-size: 0.9rem; }
+          .soc-count { font-size: 1.3rem; }
+          .soc-label { font-size: 0.72rem; word-break: break-word; }
+          .soc-list li { font-size: 0.75rem; padding: 7px 0; word-break: break-word; overflow-wrap: break-word; }
+          .soc-button {
+              width: 100%;
+              padding: 10px;
+              font-size: 0.8rem;
+              min-height: 44px;
+              border-radius: 8px;
+          }
+          .badge-critical, .badge-high,
+          .badge-medium, .badge-info {
+              font-size: 0.62rem !important;
+              padding: 1px 6px !important;
+          }
+          .demo-banner { font-size: 0.75rem; padding: 8px 10px; }
+        }
       </style>
 
       <div class="soc-box">
@@ -1091,7 +1298,7 @@ def render_soc_dashboard() -> None:
       <div class="soc-box" id="metrics-panel">
         <div class="soc-title">📊 Operational Metrics</div>
         <div class="soc-label">Alerts, attack cadence, and event velocity updated live.</div>
-        <div style="display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:12px;">
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;">
           <div style="background:#0f172a; border-radius:12px; padding:12px; text-align:center;">
             <div class="soc-label">Alerts</div>
             <div id="metric-alerts" class="soc-count" style="color:#fb7185;">0</div>
@@ -1137,6 +1344,7 @@ def render_soc_dashboard() -> None:
     <script>
       const baseUrl = "{{API_BASE_URL}}";
       const token = "{{TOKEN}}";
+      const is_admin = "{{ROLE}}" === "admin";
       const wsUrl = baseUrl.replace(/^http/, "ws") + "/api/v1/ws/traffic";
 
       const alerts = [], timeline = [], notifications = [], logs = [];
@@ -1190,7 +1398,11 @@ def render_soc_dashboard() -> None:
             <li>
               ${badgeHtml(item.severity)} <strong>${item.description}</strong><br/>
               <small style="color:#64748b;">${item.timestamp ? item.timestamp.substring(11,19) : ts()} &bull; ${item.alert_type||'Unknown'} &bull; ${item.src_ip||'—'}</small><br/>
-              <button class="soc-button" style="margin-top:6px;" onclick="ackAlert(${item.id})">✓ Acknowledge</button>
+              ${is_admin ?
+                '<button class="soc-button" style="margin-top:6px;" onclick="ackAlert(' + item.id + ')">✓ Acknowledge</button>'
+                :
+                '<span style="font-size:0.75rem;color:#64748b;font-style:italic;">View Only</span>'
+              }
             </li>
           `).join("");
         }
@@ -1353,8 +1565,8 @@ def render_soc_dashboard() -> None:
       renderState();
     </script>
     """
-    html = html.replace("{{API_BASE_URL}}", api_base_url).replace("{{TOKEN}}", token)
-    components.html(html, height=1100, scrolling=True)
+    html = html.replace("{{API_BASE_URL}}", api_base_url).replace("{{TOKEN}}", token).replace("{{ROLE}}", _role)
+    components.html(html, height=900, scrolling=True)
 
 
 
@@ -1456,13 +1668,12 @@ def render_about() -> None:
     """)
 
     st.markdown("---")
-    st.markdown("### 🚀 How to Run")
-    st.markdown("**Terminal 1 — Backend:**")
-    st.code("uvicorn backend.api.main:app --reload --host 0.0.0.0 --port 8000", language="bash")
-    st.markdown("**Terminal 2 — Frontend:**")
-    st.code("streamlit run frontend/App.py", language="bash")
-    st.markdown("**First Login:**")
-    st.write("Go to the **Login** tab → enter any username & password → click **Create Admin** → then **Sign In**.")
+    st.markdown("### 🚀 Deployment")
+    st.info(
+        "This application is deployed and managed automatically. "
+        "The backend may take up to **1 minute** to fully load on first visit. "
+        "If features appear unavailable, please wait a moment and refresh."
+    )
 
     st.markdown("---")
     st.markdown("### 📋 All Features")
@@ -1493,11 +1704,174 @@ def render_about() -> None:
 
 
 
+def render_onboarding_guide() -> None:
+    """Render a step-by-step onboarding guide using pure Streamlit widgets."""
+
+    STEPS = [
+        ("\U0001F44B", "Welcome to Safeguard-AI!",
+         "This quick tour shows every feature of your AI Security Platform. "
+         "Tap **Next** to begin, or skip anytime."),
+        ("\U0001F510", "Login Tab",
+         "You are already signed in! Manage your account here. "
+         "Sign out and switch users anytime."),
+        ("\U0001F3E0", "Home Tab",
+         "Your dashboard overview with a getting-started checklist, "
+         "platform summary, and backend health status."),
+        ("\U0001F4E4", "Upload Tab",
+         "Upload CSV network logs here. The AI model analyzes every row "
+         "and classifies traffic as **Normal** or **Attack** (DDoS, BruteForce, etc)."),
+        ("\U0001F3AF", "Live Predictions",
+         "Simulate real-time attacks! Choose a profile, adjust batch size, "
+         "and watch the AI classify threats live with animated charts."),
+        ("\U0001F4CA", "Statistics & Analytics",
+         "Rich visualizations of your data \u2014 attack distributions, "
+         "confidence scores, pie charts, and time-series analytics."),
+        ("\U0001F50D", "Explanations Tab",
+         "See **WHY** the AI made each prediction. Uses SHAP explainability "
+         "to show which network features influenced the model\u2019s decision."),
+        ("\U0001F5A5\uFE0F", "SOC Dashboard",
+         "A live Security Operations Center \u2014 real-time alerts, event timeline, "
+         "threat severity badges, and one-click acknowledgement."),
+        ("\U0001F916", "SOC Assistant",
+         "Your AI analyst \u2014 paste any security event JSON and get a "
+         "human-readable threat summary with remediation steps."),
+        ("\u2630", "Sidebar \u2192 Scanners",
+         "Tap the **\u2630 menu** (top-left) to access **Deep Security Scanner** "
+         "(website audit) and **Active Scanner** (port scanning any IP or domain)."),
+        ("\U0001F680", "You are All Set!",
+         "Start exploring! Upload data, run a live simulation, or scan a website. "
+         "Every feature is fully functional. Happy hunting! \U0001F6E1\uFE0F"),
+    ]
+
+    st.session_state.setdefault("onboarding_step", 0)
+    step = st.session_state["onboarding_step"]
+    step = min(step, len(STEPS) - 1)
+
+    icon, title, desc = STEPS[step]
+    total = len(STEPS)
+
+    dots_html = "".join(
+        '<span style="display:inline-block;width:{w};height:7px;border-radius:4px;'
+        'background:{bg};transition:all 0.3s;"></span>'.format(
+            w="18px" if i == step else "7px",
+            bg="#38bdf8" if i == step else "rgba(148,163,184,0.25)"
+        )
+        for i in range(total)
+    )
+
+    st.markdown("""
+    <div style="
+        background:linear-gradient(135deg,#0f172a 0%%,#1e1b4b 100%%);
+        border:1px solid rgba(56,189,248,0.3);
+        border-radius:20px; padding:1.6rem 1.4rem;
+        max-width:460px; margin:0 auto 1rem;
+        box-shadow:0 20px 50px rgba(0,0,0,0.5),0 0 40px rgba(56,189,248,0.1);
+        position:relative; overflow:hidden;
+    ">
+        <div style="position:absolute;top:-40%%;left:-40%%;width:180%%;height:180%%;
+            background:radial-gradient(circle,rgba(56,189,248,0.05),transparent 60%%);
+            pointer-events:none;"></div>
+        <div style="display:flex;gap:5px;margin-bottom:0.8rem;position:relative;">
+            %s
+        </div>
+        <div style="font-size:2rem;margin-bottom:0.4rem;position:relative;">%s</div>
+        <div style="font-size:0.62rem;color:#475569;letter-spacing:2px;
+            text-transform:uppercase;margin-bottom:0.2rem;position:relative;">
+            STEP %d OF %d
+        </div>
+        <h3 style="font-size:1.15rem;font-weight:700;color:#38bdf8;
+            margin:0 0 0.4rem;position:relative;">%s</h3>
+        <p style="font-size:0.82rem;color:#94a3b8;line-height:1.6;
+            margin:0;position:relative;">%s</p>
+    </div>
+    """ % (dots_html, icon, step + 1, total, title, desc), unsafe_allow_html=True)
+
+    if step > 0:
+        btn_cols = st.columns([1, 2, 1])
+    else:
+        btn_cols = st.columns([2, 1])
+
+    if step > 0:
+        with btn_cols[0]:
+            if st.button("\u2190 Back", key="sg_back", use_container_width=True):
+                st.session_state["onboarding_step"] = step - 1
+                st.rerun()
+
+    next_col = btn_cols[1] if step > 0 else btn_cols[0]
+    with next_col:
+        if step < total - 1:
+            if st.button("Next \u2192", key="sg_next", type="primary",
+                          use_container_width=True):
+                st.session_state["onboarding_step"] = step + 1
+                st.rerun()
+        else:
+            if st.button("\u2713 Start Using App", key="sg_finish", type="primary",
+                          use_container_width=True):
+                st.session_state["onboarding_done"] = True
+                st.session_state.pop("onboarding_step", None)
+                st.rerun()
+
+    skip_col = btn_cols[-1]
+    with skip_col:
+        if st.button("Skip", key="sg_skip", use_container_width=True):
+            st.session_state["onboarding_done"] = True
+            st.session_state.pop("onboarding_step", None)
+            st.rerun()
+
+
 def main() -> None:
     init_state()
+
+    # ── Viewport meta for mobile rendering ───────────────────────────────────
+    st.markdown("""
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1.0,
+                       maximum-scale=1.0, user-scalable=no">
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style"
+              content="black-translucent">
+    """, unsafe_allow_html=True)
+
     apply_custom_css()
     render_sidebar()
     render_topbar()
+
+    # ── Fixed top-right auth status badge ────────────────────────────────────
+    _auth_user = st.session_state.get("auth_user")
+    _auth_role = st.session_state.get("auth_role", "user")
+    if _auth_user:
+        _role_label = "Admin" if _auth_role == "admin" else "User"
+        _badge = f"""
+        <div style="position:fixed;top:0.45rem;right:1.2rem;
+          z-index:99999;display:flex;align-items:center;gap:0.5rem;
+          background:rgba(52,211,153,0.12);
+          border:1px solid rgba(52,211,153,0.35);
+          border-radius:20px;padding:0.28rem 0.9rem;
+          font-size:0.78rem;color:#34d399;font-weight:600;
+          backdrop-filter:blur(10px);cursor:default;"
+          title="Go to Login tab to sign out">
+          👤 {_auth_user}
+          <span style="opacity:0.6;font-size:0.7rem;">
+            ({_role_label}) ● Signed In
+          </span>
+        </div>"""
+    else:
+        _badge = """
+        <div style="position:fixed;top:0.45rem;right:1.2rem;
+          z-index:99999;display:flex;align-items:center;gap:0.5rem;
+          background:rgba(245,158,11,0.1);
+          border:1px solid rgba(245,158,11,0.35);
+          border-radius:20px;padding:0.28rem 0.9rem;
+          font-size:0.78rem;color:#f59e0b;font-weight:600;
+          backdrop-filter:blur(10px);">
+          🔒 Not Signed In — go to Login tab
+        </div>"""
+    st.markdown(_badge, unsafe_allow_html=True)
+
+    # ── Onboarding guide for first-time users ────────────────────────────────
+    if _auth_user and not st.session_state.get("onboarding_done", False):
+        render_onboarding_guide()
 
     tabs = st.tabs(
         [

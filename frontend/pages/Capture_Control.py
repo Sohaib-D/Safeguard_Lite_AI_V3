@@ -33,7 +33,7 @@ def start_capture(interface: str = None) -> Dict[str, Any]:
     if err:
         return {"error": str(err.message)}
     if res is None:
-        return {"error": "Backend returned no response. Check server logs."}
+        return {"error": "🔐 Authentication required. Please sign in from the Login tab to use Live Capture."}
     return res
 
 def stop_capture() -> Dict[str, Any]:
@@ -43,7 +43,7 @@ def stop_capture() -> Dict[str, Any]:
     if err:
         return {"error": str(err.message)}
     if res is None:
-        return {"error": "Backend returned no response. Check server logs."}
+        return {"error": "🔐 Authentication required. Please sign in from the Login tab to stop the capture."}
     return res
 
 def main():

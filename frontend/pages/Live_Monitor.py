@@ -89,6 +89,13 @@ def render_live_monitor():
         render_api_error(err)
         return
 
+    if alerts_data is None:
+        st.warning(
+            "🔐 **Authentication required.** "
+            "Please sign in from the **Login** tab to view live threat alerts."
+        )
+        return
+
     # Unpack envelope: API returns {"alerts": [...], "total": N}
     if isinstance(alerts_data, dict):
         alert_list = alerts_data.get("alerts", [])

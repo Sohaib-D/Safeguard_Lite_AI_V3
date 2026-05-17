@@ -1123,6 +1123,481 @@ def apply_custom_css():
         .animate-slideIn { animation: slideInLeft 0.3s ease-out; }
         .animate-pulse { animation: pulse 2s ease-in-out infinite; }
         .animate-glow { animation: glowPulse 2s ease-in-out infinite; }
+
+        /* ===================================================================
+           HIDE STREAMLIT TOP CHROME (header, deploy button, toolbar)
+           =================================================================== */
+        [data-testid="stHeader"]          { display: none !important; }
+        [data-testid="stToolbar"]         { display: none !important; }
+        [data-testid="stAppDeployButton"] { display: none !important; }
+        [data-testid="stMainMenuButton"]  { display: none !important; }
+        [data-testid="stDecoration"]      { display: none !important; }
+        .stAppHeader                      { display: none !important; }
+
+        /* Remove blank space left behind by the hidden header */
+        .main .block-container {
+            padding-top: 0.75rem !important;
+            margin-top: 0 !important;
+        }
+        /* ── Sidebar: reduce top gap (GLOBAL) ─────────── */
+        section[data-testid="stSidebar"] > div:first-child {
+            padding-top: 0.2rem !important;
+        }
+        section[data-testid="stSidebar"] [data-testid="stSidebarNav"] {
+            padding-top: 0 !important;
+            margin-top: 0 !important;
+        }
+        /* Reduce the Streamlit sidebar header (close btn area) */
+        [data-testid="stSidebarHeader"] {
+            padding: 0.3rem 0.5rem !important;
+            min-height: unset !important;
+        }
+        /* ── Sidebar collapse arrow → ☰ hamburger (GLOBAL) ─
+           Streamlit 1.39: data-testid="stBaseButton-headerNoPadding"
+           Double-escape for Python: \\2630 → CSS \2630 → ☰ ───────── */
+        button[data-testid="stBaseButton-headerNoPadding"] {
+            color: transparent !important;
+            overflow: hidden !important;
+        }
+        button[data-testid="stBaseButton-headerNoPadding"] svg {
+            display: none !important;
+        }
+        button[data-testid="stBaseButton-headerNoPadding"]::after {
+            content: '\\2630' !important;
+            font-size: 1.3rem !important;
+            color: #38bdf8 !important;
+            line-height: 1 !important;
+        }
+        /* Close button (inside sidebar) → ✕ */
+        section[data-testid="stSidebar"] button[data-testid="stBaseButton-headerNoPadding"]::after {
+            content: '\\2715' !important;
+            font-size: 1.1rem !important;
+            color: #94a3b8 !important;
+        }
+        /* ── Main content: reduce top gap ─────────────────── */
+        [data-testid="stMainBlockContainer"] {
+            padding-top: 1.5rem !important;
+        }
+
+        /* ═══════════════════════════════════════════════════
+           MOBILE RESPONSIVENESS — screens up to 768px wide
+           ═══════════════════════════════════════════════════ */
+
+        @media screen and (max-width: 768px) {
+
+          /* ── Layout & Spacing ─────────────────────────── */
+          .main .block-container {
+              padding: 0.5rem 0.6rem 2rem !important;
+              max-width: 100vw !important;
+              overflow-x: hidden !important;
+          }
+
+          /* ── GLOBAL TEXT CONTAINMENT ─────────────────── */
+          .main .block-container * {
+              max-width: 100% !important;
+              box-sizing: border-box !important;
+          }
+          .stMarkdown, .stMarkdown p, .stMarkdown li,
+          .stMarkdown span, .stMarkdown div,
+          [data-testid="stCaptionContainer"],
+          [data-testid="stAlert"] div,
+          [data-testid="stAlert"] p {
+              word-wrap: break-word !important;
+              overflow-wrap: break-word !important;
+              word-break: break-word !important;
+              white-space: normal !important;
+              max-width: 100% !important;
+          }
+
+          /* Inline code tags (like /predict) must not overflow */
+          .stMarkdown code, p code, li code,
+          [data-testid="stAlert"] code {
+              word-break: break-all !important;
+              white-space: pre-wrap !important;
+              font-size: 0.78rem !important;
+          }
+
+          /* ── Sidebar: collapse arrow → hamburger ☰ ───── */
+          [data-testid="collapsedControl"] {
+              top: 0.3rem !important;
+          }
+          [data-testid="collapsedControl"] svg {
+              display: none !important;
+          }
+          [data-testid="collapsedControl"] button::before {
+              content: '☰' !important;
+              font-size: 1.4rem !important;
+              color: var(--accent-cyan) !important;
+              display: flex !important;
+              align-items: center !important;
+              justify-content: center !important;
+          }
+
+          /* ── Sidebar: remove top gap ────────────────── */
+          section[data-testid="stSidebar"] {
+              width: 80vw !important;
+              min-width: unset !important;
+              max-width: 320px !important;
+          }
+          section[data-testid="stSidebar"] > div:first-child {
+              padding-top: 0.3rem !important;
+          }
+          section[data-testid="stSidebar"][aria-expanded="true"] {
+              transform: translateX(0) !important;
+          }
+          section[data-testid="stSidebar"][aria-expanded="false"] {
+              transform: translateX(-100%) !important;
+          }
+          /* Close button inside sidebar: also hamburger style */
+          section[data-testid="stSidebar"] button[kind="header"] svg {
+              display: none !important;
+          }
+          section[data-testid="stSidebar"] button[kind="header"]::before {
+              content: '✕' !important;
+              font-size: 1.2rem !important;
+              color: var(--text-secondary) !important;
+          }
+
+          /* ── Tabs: horizontal scroll on overflow ──────── */
+          [data-testid="stTabs"] > div:first-child {
+              overflow-x: auto !important;
+              white-space: nowrap !important;
+              -webkit-overflow-scrolling: touch !important;
+              scrollbar-width: none !important;
+          }
+          [data-testid="stTabs"] > div:first-child::-webkit-scrollbar {
+              display: none !important;
+          }
+          [data-testid="stTabsTab"] {
+              font-size: 0.75rem !important;
+              padding: 0.4rem 0.6rem !important;
+              min-width: max-content !important;
+          }
+
+          /* ── st.columns → single column stack ────────── */
+          [data-testid="stHorizontalBlock"] {
+              flex-direction: column !important;
+              gap: 0.75rem !important;
+          }
+          [data-testid="stHorizontalBlock"] > div {
+              width: 100% !important;
+              min-width: unset !important;
+              flex: 1 1 100% !important;
+          }
+
+          /* ── Metrics: 2-column grid instead of 4 ─────── */
+          [data-testid="stMetric"] {
+              min-width: 45% !important;
+          }
+
+          /* ── Typography scaling ───────────────────────── */
+          h1 { font-size: 1.3rem !important; }
+          h2 { font-size: 1.1rem !important; }
+          h3 { font-size: 1rem !important; }
+          p, li, label {
+              font-size: 0.84rem !important;
+              line-height: 1.5 !important;
+          }
+          /* Less important text: smaller */
+          .stCaption, [data-testid="stCaptionContainer"],
+          .section-label, .hero-subtitle,
+          [data-testid="stMarkdownContainer"] small {
+              font-size: 0.72rem !important;
+              color: var(--text-secondary) !important;
+          }
+
+          /* ── Buttons: full width + touch-safe height ──── */
+          [data-testid="stButton"] > button {
+              width: 100% !important;
+              min-height: 48px !important;
+              font-size: 0.88rem !important;
+              border-radius: 10px !important;
+          }
+
+          /* ── Input fields: larger touch targets ──────── */
+          input[type="text"],
+          input[type="password"],
+          input[type="email"],
+          textarea,
+          [data-testid="stTextInput"] input,
+          [data-testid="stTextArea"] textarea {
+              min-height: 48px !important;
+              font-size: 1rem !important;
+              border-radius: 10px !important;
+              padding: 0.6rem 0.9rem !important;
+              -webkit-appearance: none !important;
+          }
+
+          /* ── Select boxes / dropdowns ─────────────────── */
+          select,
+          [data-testid="stSelectbox"] select {
+              font-size: 1rem !important;
+              min-height: 48px !important;
+          }
+
+          /* ── DataFrames: horizontal scroll ───────────── */
+          [data-testid="stDataFrame"],
+          [data-testid="stTable"],
+          .stDataFrame {
+              overflow-x: auto !important;
+              -webkit-overflow-scrolling: touch !important;
+              max-width: 100% !important;
+          }
+          [data-testid="stDataFrame"] > div {
+              min-width: 400px !important;
+          }
+
+          /* ── Charts / pyplot images ───────────────────── */
+          [data-testid="stImage"] img,
+          .stPyplot img {
+              max-width: 100% !important;
+              height: auto !important;
+          }
+
+          /* ── Expanders ────────────────────────────────── */
+          [data-testid="stExpander"] {
+              border-radius: 10px !important;
+          }
+          [data-testid="stExpander"] summary {
+              font-size: 0.88rem !important;
+              padding: 0.5rem !important;
+          }
+
+          /* ── Code blocks ──────────────────────────────── */
+          pre, code {
+              font-size: 0.72rem !important;
+              overflow-x: auto !important;
+              white-space: pre-wrap !important;
+              word-break: break-all !important;
+          }
+
+          /* ── Top-right auth badge: smaller on mobile ──── */
+          div[style*="position:fixed"][style*="right:1.2rem"] {
+              top: 0.3rem !important;
+              right: 0.5rem !important;
+              font-size: 0.62rem !important;
+              padding: 0.18rem 0.5rem !important;
+              max-width: 50vw !important;
+              overflow: hidden !important;
+              text-overflow: ellipsis !important;
+              white-space: nowrap !important;
+          }
+
+          /* ── Hero / banner cards ──────────────────────── */
+          .hero-card, .hero-banner {
+              padding: 0.85rem !important;
+              border-radius: 12px !important;
+          }
+          .hero-card h2, .hero-banner .hero-title {
+              font-size: 1.1rem !important;
+          }
+          .hero-card p, .hero-banner .hero-subtitle {
+              font-size: 0.78rem !important;
+          }
+
+          /* ── Session stats grid in sidebar: keep 2x2 ─── */
+          .stats-strip {
+              grid-template-columns: repeat(2, 1fr) !important;
+              gap: 6px !important;
+          }
+
+          /* ── SOC / Scanner custom components ─────────── */
+          iframe {
+              max-width: 100% !important;
+              border-radius: 12px !important;
+          }
+
+          /* ── Containers / cards ───────────────────────── */
+          [data-testid="stVerticalBlock"] >
+          [data-testid="stVerticalBlockBorderWrapper"] {
+              border-radius: 12px !important;
+          }
+
+          /* ── Alerts / info / warning boxes ───────────── */
+          [data-testid="stAlert"] {
+              padding: 0.5rem 0.7rem !important;
+              font-size: 0.78rem !important;
+              border-radius: 10px !important;
+              overflow-wrap: break-word !important;
+              word-break: break-word !important;
+          }
+
+          /* ── Spinner text ──────────────────────────────── */
+          [data-testid="stSpinner"] p {
+              font-size: 0.78rem !important;
+          }
+
+          /* ── Topbar: compact on mobile ──────────────── */
+          div[style*="justify-content:space-between"][style*="border-bottom"] {
+              padding: 0.4rem 0.6rem !important;
+              margin-bottom: 0.5rem !important;
+              flex-wrap: wrap !important;
+          }
+          div[style*="justify-content:space-between"][style*="border-bottom"] h2 {
+              font-size: 0.95rem !important;
+          }
+          div[style*="justify-content:space-between"][style*="border-bottom"] div[style*="font-size:0.78rem"] {
+              font-size: 0.65rem !important;
+          }
+          div[style*="justify-content:space-between"][style*="border-bottom"] div[style*="width:40px"] {
+              width: 30px !important;
+              height: 30px !important;
+          }
+          div[style*="justify-content:space-between"][style*="border-bottom"] svg {
+              width: 16px !important;
+              height: 16px !important;
+          }
+
+          /* ── Sidebar brand area ───────────────────────── */
+          section[data-testid="stSidebar"] div[style*="width:60px"][style*="height:60px"] {
+              width: 40px !important;
+              height: 40px !important;
+          }
+          section[data-testid="stSidebar"] h3 {
+              font-size: 0.95rem !important;
+          }
+
+          /* ── Slider touch targets ─────────────────────── */
+          [data-testid="stSlider"] [role="slider"] {
+              width: 28px !important;
+              height: 28px !important;
+          }
+
+          /* ── Metric cards ──────────────────────────────── */
+          .metric-card {
+              padding: 10px 12px !important;
+              border-radius: 10px !important;
+          }
+
+          /* ── JSON / stMetric: compact ──────────────────── */
+          [data-testid="stJson"] {
+              overflow-x: auto !important;
+              max-width: 100% !important;
+              font-size: 0.72rem !important;
+          }
+          [data-testid="stMetricValue"] {
+              font-size: 1.2rem !important;
+          }
+          [data-testid="stMetricLabel"] {
+              font-size: 0.7rem !important;
+          }
+
+          /* ── Markdown tables ───────────────────────────── */
+          .stMarkdown table {
+              display: block !important;
+              overflow-x: auto !important;
+              -webkit-overflow-scrolling: touch !important;
+              max-width: 100% !important;
+          }
+          .stMarkdown table th,
+          .stMarkdown table td {
+              font-size: 0.74rem !important;
+              padding: 0.35rem 0.5rem !important;
+              white-space: nowrap !important;
+          }
+
+          /* ── File uploader / download ──────────────────── */
+          [data-testid="stFileUploader"] { width: 100% !important; }
+          [data-testid="stFileUploader"] section { padding: 0.8rem !important; }
+          [data-testid="stDownloadButton"] > button {
+              width: 100% !important;
+              min-height: 48px !important;
+          }
+
+          /* ── Checkbox / radio: tap area ─────────────── */
+          [data-testid="stCheckbox"],
+          [data-testid="stRadio"] label {
+              min-height: 44px !important;
+              display: flex !important;
+              align-items: center !important;
+          }
+
+          /* ── Tab panel padding ──────────────────────── */
+          [data-testid="stTabPanel"] {
+              padding: 0.3rem 0 !important;
+          }
+        }
+
+        /* ═══════════════════════════════════════════════════
+           SMALL PHONES — screens up to 390px (iPhone SE,
+           Galaxy A series)
+           ═══════════════════════════════════════════════════ */
+
+        @media screen and (max-width: 390px) {
+          .main .block-container {
+              padding: 0.4rem 0.5rem 2rem !important;
+          }
+          h1 { font-size: 1.2rem !important; }
+          h2 { font-size: 1.05rem !important; }
+          h3 { font-size: 0.95rem !important; }
+          [data-testid="stTabsTab"] {
+              font-size: 0.68rem !important;
+              padding: 0.3rem 0.45rem !important;
+          }
+        }
+
+        /* ═══════════════════════════════════════════════════
+           iOS SAFARI — specific fixes
+           ═══════════════════════════════════════════════════ */
+
+        /* Prevent iOS rubber-band scroll causing layout shift */
+        html {
+          -webkit-overflow-scrolling: touch;
+          overscroll-behavior: none;
+        }
+
+        /* Fix iOS notch / safe area padding */
+        .main .block-container {
+          padding-bottom: max(2rem, env(safe-area-inset-bottom)) !important;
+          padding-left: max(0.75rem, env(safe-area-inset-left)) !important;
+          padding-right: max(0.75rem, env(safe-area-inset-right)) !important;
+        }
+
+        /* Prevent iOS tap highlight flash on buttons */
+        * {
+          -webkit-tap-highlight-color: transparent;
+          -webkit-touch-callout: none;
+        }
+        /* Re-enable text selection where needed */
+        input, textarea, [contenteditable] {
+          -webkit-touch-callout: default !important;
+          -webkit-user-select: text !important;
+        }
+
+        /* Fix 100vh bug on iOS Safari (address bar eats space) */
+        .main {
+          min-height: -webkit-fill-available !important;
+        }
+
+        /* ===================================================================
+           BASE COMPONENT STYLES (needed for classes used in App.py)
+           =================================================================== */
+        .hero-card {
+          background: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #0f172a 100%);
+          border: 1px solid rgba(56, 189, 248, 0.15);
+          border-radius: 16px;
+          padding: 2rem 2.5rem;
+          margin-bottom: 1.5rem;
+          position: relative;
+          overflow: hidden;
+        }
+        .hero-card::after {
+          content: '';
+          position: absolute;
+          bottom: 0; left: 0;
+          width: 100%; height: 2px;
+          background: linear-gradient(90deg, transparent, #38bdf8, transparent);
+          animation: scan-line 3s ease-in-out infinite;
+        }
+
+        .metric-card {
+          background: #111827;
+          border: 1px solid #1e293b;
+          border-radius: 12px;
+          padding: 16px 20px;
+          margin-bottom: 12px;
+        }
+
         </style>
     """, unsafe_allow_html=True)
 

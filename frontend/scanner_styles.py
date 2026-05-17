@@ -47,5 +47,37 @@ SCANNER_CSS = """
 .effort-high{background:rgba(239,68,68,.1);color:#ef4444}
 .finding-row{padding:12px 16px;border-bottom:1px solid #1e293b;display:flex;align-items:center;gap:12px}
 .finding-row:hover{background:rgba(56,189,248,.03)}
+@media (max-width: 768px) {
+  .hero-banner { padding: 1rem !important; }
+  .hero-title { font-size: 1.15rem !important; }
+  .hero-subtitle { font-size: 0.78rem !important; }
+  .stats-strip { grid-template-columns: repeat(2, 1fr) !important; gap: 6px !important; }
+  .stat-value { font-size: 1.4rem !important; }
+  .stat-label { font-size: 0.62rem !important; }
+  .result-card { padding: 0.75rem !important; }
+  .section-header { font-size: 1rem !important; }
+  .grade-badge { font-size: 1.8rem !important; padding: 0.5rem !important; }
+  .risk-gauge { transform: scale(0.85); }
+  .vuln-item { padding: 0.6rem !important; }
+  .vuln-title { font-size: 0.85rem !important; }
+  .posture-grid { grid-template-columns: repeat(2, 1fr) !important; gap: 6px !important; }
+  .export-btn { width: 100% !important; min-height: 44px !important; }
+  .metric-card { padding: 10px 14px !important; border-radius: 10px !important; }
+  .metric-card-value { font-size: 0.95rem !important; }
+  .metric-card-label { font-size: 0.6rem !important; }
+  .critical-card { padding: 10px 14px !important; flex-direction: column !important; gap: 6px !important; }
+  .critical-card-text { font-size: 0.78rem !important; }
+  .info-card { padding: 14px !important; }
+  .info-card-title { font-size: 0.68rem !important; }
+  .info-card-content { font-size: 0.78rem !important; }
+  .posture-row { flex-wrap: wrap !important; gap: 6px !important; }
+  .posture-label { min-width: 100px !important; font-size: 0.68rem !important; text-align: left !important; }
+  .finding-row { flex-direction: column !important; align-items: flex-start !important; padding: 10px 12px !important; }
+  .roadmap-item { gap: 10px !important; padding: 10px 0 !important; }
+  .roadmap-num { width: 24px !important; height: 24px !important; font-size: 0.65rem !important; }
+  .roadmap-action { font-size: 0.78rem !important; }
+  .gauge-card { padding: 18px !important; }
+  .sev-badge { font-size: 0.62rem !important; padding: 2px 7px !important; }
+}
 </style>
 """

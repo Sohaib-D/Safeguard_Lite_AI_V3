@@ -47,6 +47,13 @@ def render_active_scanner():
             render_api_error(err)
             return
 
+        if result is None:
+            st.warning(
+                "🔐 **Authentication required.** "
+                "Please sign in from the **Login** tab to use the Active Scanner."
+            )
+            return
+
         if result.get("error"):
             st.error(f"Scan failed: {result['error']}")
             return
