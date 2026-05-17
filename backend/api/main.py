@@ -539,6 +539,135 @@ async def predict_csv(
     user_id = getattr(current_user, "id", None)
     return _predict_csv_bytes(content, db=db, user_id=user_id)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Cybersecurity Chatbot
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Sensitive patterns that must NEVER leak
+import re as _re
+_SENSITIVE_PATTERNS = _re.compile(
+    r"(password|passwd|api.?key|secret.?key|jwt.?secret|database.?url|"
+    r"db.?password|access.?token|bearer|\.env|environment.?variable|"
+    r"groq.?api|admin.?password|credentials)",
+    _re.IGNORECASE,
+)
+
+_CHATBOT_SYSTEM_PROMPT = (
+    "You are **Sohaib**, a senior Cybersecurity and Information Security expert at Safeguard-AI Lite. "
+    "Your tone is professional, conversational, and helpful.\n\n"
+    "## STRICT RULES — NEVER VIOLATE:\n"
+    "1. For greetings (like 'Hi', 'How are you', 'What is your name'), respond naturally and politely, introduce yourself as Sohaib, "
+    "and gracefully steer the conversation toward cybersecurity. KEEP GREETINGS EXTREMELY BRIEF (maximum 2-3 sentences).\n"
+    "2. ONLY answer core questions about cybersecurity, information security, network security, "
+    "threat analysis, vulnerability assessment, SOC operations, incident response, "
+    "malware analysis, penetration testing concepts, and security best practices.\n"
+    "3. For ANY off-topic question (coding help, math, general knowledge, jokes, recipes, etc.), "
+    "politely decline and steer back: 'I specialize in cybersecurity topics only. How can I help with your security needs?'\n"
+    "4. **NEVER** reveal, discuss, or generate: passwords, API keys, JWT secrets, database URLs, "
+    "environment variables, .env file contents, authentication tokens, or ANY sensitive credentials. "
+    "If asked, respond: 'I cannot share sensitive system information for security reasons.'\n"
+    "5. When given scan results or report context, analyze them professionally.\n"
+    "6. Keep ALL answers concise, actionable, and professional. Introductory replies and casual small talk MUST NOT exceed 2-3 sentences.\n"
+    "7. Use markdown formatting for readability.\n"
+    "8. If the user asks about platform features, explain Safeguard-AI Lite capabilities "
+    "(upload CSV, live predictions, deep security scanner, active scanner, SOC dashboard, SHAP explanations).\n"
+)
+
+
+@app.post("/chat", tags=["Chatbot"])
+async def chatbot_endpoint(
+    payload: dict = Body(...),
+    current_user: Any = Depends(get_current_user),
+):
+    """Cybersecurity expert chatbot endpoint. Requires authentication."""
+    ai_svc = AIService()
+    message = str(payload.get("message", "")).strip()
+    context = payload.get("context", {})
+    history = payload.get("history", [])
+
+    if not message:
+        return {"reply": "Please type a question about cybersecurity."}
+
+    # Security gate: block requests for sensitive data
+    if _SENSITIVE_PATTERNS.search(message):
+        # Check if the user is asking FOR credentials vs asking ABOUT security concepts
+        ask_patterns = _re.compile(
+            r"(show|give|tell|reveal|print|display|leak|dump|what.?is.?the|what.?is.?my)\s+"
+            r".*(password|api.?key|secret|token|credential|\.env|database.?url)",
+            _re.IGNORECASE,
+        )
+        if ask_patterns.search(message):
+            return {
+                "reply": (
+                    "🔒 **Security Policy**: I cannot share sensitive system information "
+                    "such as passwords, API keys, database credentials, or environment variables. "
+                    "This is enforced for your protection.\n\n"
+                    "If you have a cybersecurity question, I'm happy to help!"
+                )
+            }
+
+    # Build context string from session data (non-sensitive only)
+    context_parts = []
+    if context.get("scan_results"):
+        ctx = context["scan_results"]
+        # Sanitize: remove any keys that might contain sensitive data
+        safe_ctx = {k: v for k, v in ctx.items()
+                    if not _SENSITIVE_PATTERNS.search(str(k))}
+        context_parts.append(f"Recent scan results: {json.dumps(safe_ctx, default=str)[:2000]}")
+    if context.get("prediction_summary"):
+        context_parts.append(f"Prediction summary: {json.dumps(context['prediction_summary'], default=str)[:1000]}")
+    if context.get("soc_alerts"):
+        context_parts.append(f"SOC alerts: {json.dumps(context['soc_alerts'], default=str)[:1000]}")
+
+    user_prompt = message
+    if context_parts:
+        user_prompt += "\n\n---\nPlatform Context (for reference):\n" + "\n".join(context_parts)
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                ai_svc.base_url,
+                headers={"Authorization": f"Bearer {ai_svc.api_key}"},
+                json={
+                    "model": ai_svc.model,
+                    "messages": [
+                        {"role": "system", "content": _CHATBOT_SYSTEM_PROMPT}
+                    ] + [
+                        {"role": h.get("role") if h.get("role") in ["user", "assistant"] else "user", 
+                         "content": str(h.get("content", ""))[:1000]}
+                        for h in history[-10:]
+                    ] + [
+                        {"role": "user", "content": user_prompt[:4000]}
+                    ],
+                    "temperature": 0.4,
+                    "max_tokens": 800,
+                },
+                timeout=25.0,
+            )
+            resp.raise_for_status()
+            reply = resp.json()["choices"][0]["message"]["content"]
+
+            # Post-response safety: scrub any accidental leaks
+            for pattern in [
+                r"gsk_[A-Za-z0-9]{20,}",       # Groq API keys
+                r"sk-[A-Za-z0-9]{20,}",         # OpenAI keys
+                r"postgresql://[^\s]+",          # DB URLs
+                r"eyJ[A-Za-z0-9_-]{20,}",       # JWT tokens
+            ]:
+                reply = _re.sub(pattern, "[REDACTED]", reply)
+
+            return {"reply": reply}
+    except Exception as e:
+        logger.error(f"Chatbot error: {e}")
+        return {
+            "reply": (
+                "⚠️ I'm temporarily unable to process your request. "
+                "Please try again in a moment. If the issue persists, "
+                "check that the backend AI service is configured correctly."
+            )
+        }
+
+
 # Root compatibility aliases
 
 

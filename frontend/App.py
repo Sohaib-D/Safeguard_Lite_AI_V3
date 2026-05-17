@@ -1704,6 +1704,351 @@ def render_about() -> None:
 
 
 
+def render_chatbot_widget() -> None:
+    """Render a floating cybersecurity chatbot widget at the bottom-right corner.
+    Uses components.html to inject into the parent document so position:fixed works."""
+
+    auth_token = st.session_state.get("auth_token", "")
+    api_base = st.session_state.get(
+        "api_base_url",
+        os.environ.get("SAFEGUARD_API_BASE_URL", "http://127.0.0.1:8000"),
+    )
+    is_authed = bool(auth_token and st.session_state.get("auth_user"))
+
+    # Gather non-sensitive context from session state
+    ctx = {}
+    if is_authed:
+        if st.session_state.get("scan_result"):
+            sr = st.session_state["scan_result"]
+            ctx["scan_results"] = {
+                k: v for k, v in sr.items()
+                if k in ("target", "open_ports", "technologies",
+                         "security_headers", "ssl_info", "dns_info")
+            }
+        if st.session_state.get("prediction_history"):
+            hist = st.session_state["prediction_history"]
+            if isinstance(hist, list) and hist:
+                ctx["prediction_summary"] = {
+                    "total": len(hist),
+                    "latest": str(hist[-1])[:500] if hist else "",
+                }
+
+    # Escape for JS string embedding
+    ctx_str = json.dumps(ctx, default=str)
+
+    # Build the chat body HTML based on auth state
+    if is_authed:
+        chat_body_html = (
+            '<div class="sg-chat-messages" id="sg-chat-messages">'
+            '<div class="sg-msg bot">'
+            "\U0001F44B Hello! I'm your <strong>Cybersecurity Assistant</strong>.<br><br>"
+            "Ask me about:<br>"
+            "\u2022 Network security & threat analysis<br>"
+            "\u2022 Your scan results & reports<br>"
+            "\u2022 Vulnerability assessment<br>"
+            "\u2022 Incident response best practices<br>"
+            "\u2022 Platform features & how-to"
+            "</div></div>"
+            '<div class="sg-chat-input-area">'
+            '<input type="text" id="sg-chat-input" placeholder="Ask a security question..." '
+            'autocomplete="off" spellcheck="false" />'
+            '<button class="sg-chat-send" id="sg-chat-send" onclick="sgSendMessage()" title="Send">'
+            '<svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>'
+            "</button></div>"
+        )
+    else:
+        chat_body_html = (
+            '<div class="sg-chat-noauth">'
+            '<div class="lock-icon">\U0001F512</div>'
+            "<p><strong>Login or Sign Up to chat.</strong><br>"
+            "The cybersecurity assistant is available<br>"
+            "for authenticated users only.</p></div>"
+        )
+
+    injection_js = """
+<script>
+(function() {
+    var doc = window.parent.document;
+
+    // Clean up previous instances to prevent ghost elements
+    var oldFab = doc.getElementById('sg-chat-fab');
+    if (oldFab) oldFab.remove();
+    var oldWin = doc.getElementById('sg-chat-window');
+    if (oldWin) oldWin.remove();
+    var oldStyle = doc.getElementById('sg-chat-styles');
+    if (oldStyle) oldStyle.remove();
+
+    // Preserve open state if it existed
+    if (window.parent._sgChatOpen === undefined) {
+        window.parent._sgChatOpen = false;
+    }
+
+    // Store config on parent window
+    window.parent._sgToken = "%%TOKEN%%";
+    window.parent._sgApiBase = "%%APIBASE%%";
+    window.parent._sgContext = %%CONTEXT%%;
+    window.parent._sgIsAuthed = %%AUTHED%%;
+
+    // ── Inject CSS ──────────────────────────────────────────────
+    var style = doc.createElement('style');
+    style.id = 'sg-chat-styles';
+    style.textContent = `
+    #sg-chat-fab {
+        position: fixed; bottom: 28px; right: 28px; z-index: 999999;
+        width: 58px; height: 58px; border-radius: 50%;
+        background: rgba(15, 23, 42, 0.15);
+        backdrop-filter: blur(4px);
+        -webkit-backdrop-filter: blur(4px);
+        border: 1px solid rgba(56, 189, 248, 0.2);
+        cursor: pointer;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+        display: flex; align-items: center; justify-content: center;
+        transition: all 0.3s ease;
+        animation: sg-pulse 2s infinite;
+    }
+    @keyframes sg-pulse {
+        0% { box-shadow: 0 4px 16px rgba(0,0,0,0.15), 0 0 0 0 rgba(56,189,248,0.15); }
+        70% { box-shadow: 0 4px 16px rgba(0,0,0,0.15), 0 0 0 10px rgba(56,189,248,0); }
+        100% { box-shadow: 0 4px 16px rgba(0,0,0,0.15), 0 0 0 0 rgba(56,189,248,0); }
+    }
+    #sg-chat-fab:hover { transform: scale(1.1); }
+    #sg-chat-fab svg { width: 28px; height: 28px; fill: white; }
+    #sg-chat-window {
+        position: fixed; bottom: 100px; right: 28px; z-index: 999999;
+        width: 380px; max-width: calc(100vw - 40px);
+        height: 520px; max-height: calc(100vh - 140px);
+        background: linear-gradient(180deg, #0f172a 0%%, #1e1b4b 100%%);
+        border: 1px solid rgba(56,189,248,0.25);
+        border-radius: 20px;
+        box-shadow: 0 25px 60px rgba(0,0,0,0.6), 0 0 40px rgba(56,189,248,0.08);
+        display: none; flex-direction: column;
+        overflow: hidden;
+        font-family: 'Inter', 'Segoe UI', sans-serif;
+    }
+    #sg-chat-window.open { display: flex; }
+    .sg-chat-header {
+        background: rgba(15,23,42,0.95);
+        padding: 14px 18px; display: flex; align-items: center; gap: 12px;
+        border-bottom: 1px solid rgba(56,189,248,0.15);
+    }
+    .sg-chat-header-icon {
+        width: 36px; height: 36px; border-radius: 10px;
+        background: linear-gradient(135deg, #0ea5e9, #8b5cf6);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 18px; flex-shrink: 0;
+    }
+    .sg-chat-header-text h4 { margin: 0; font-size: 14px; font-weight: 700; color: #e2e8f0; }
+    .sg-chat-header-text span { font-size: 11px; color: #64748b; }
+    .sg-chat-close {
+        margin-left: auto; background: none; border: none;
+        color: #64748b; cursor: pointer; font-size: 20px;
+        padding: 4px 8px; border-radius: 6px; transition: all 0.2s;
+    }
+    .sg-chat-close:hover { background: rgba(248,113,113,0.15); color: #f87171; }
+    .sg-chat-messages {
+        flex: 1; overflow-y: auto; padding: 16px;
+        display: flex; flex-direction: column; gap: 12px;
+    }
+    .sg-chat-messages::-webkit-scrollbar { width: 4px; }
+    .sg-chat-messages::-webkit-scrollbar-thumb { background: rgba(56,189,248,0.2); border-radius: 2px; }
+    .sg-msg { max-width: 88%%; padding: 10px 14px; border-radius: 14px;
+              font-size: 13px; line-height: 1.5; word-wrap: break-word; }
+    .sg-msg.bot {
+        align-self: flex-start; background: rgba(30,41,59,0.8);
+        border: 1px solid rgba(56,189,248,0.1); color: #cbd5e1;
+        border-bottom-left-radius: 4px;
+    }
+    .sg-msg.user {
+        align-self: flex-end; background: linear-gradient(135deg, #0ea5e9, #6366f1);
+        color: white; border-bottom-right-radius: 4px;
+    }
+    .sg-msg.bot strong { color: #38bdf8; }
+    .sg-msg.bot code { background: rgba(56,189,248,0.1); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    .sg-chat-input-area {
+        padding: 12px 14px; border-top: 1px solid rgba(56,189,248,0.12);
+        display: flex; gap: 8px; background: rgba(15,23,42,0.6);
+    }
+    .sg-chat-input-area input {
+        flex: 1; background: rgba(30,41,59,0.6); border: 1px solid rgba(56,189,248,0.15);
+        border-radius: 12px; padding: 10px 14px; color: #e2e8f0;
+        font-size: 13px; outline: none; transition: border 0.2s;
+    }
+    .sg-chat-input-area input:focus { border-color: #0ea5e9; }
+    .sg-chat-input-area input::placeholder { color: #475569; }
+    .sg-chat-send {
+        width: 40px; height: 40px; border-radius: 12px;
+        background: linear-gradient(135deg, #0ea5e9, #6366f1);
+        border: none; cursor: pointer; display: flex;
+        align-items: center; justify-content: center;
+        transition: all 0.2s; flex-shrink: 0;
+    }
+    .sg-chat-send:hover { transform: scale(1.05); }
+    .sg-chat-send:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .sg-chat-send svg { width: 18px; height: 18px; fill: white; }
+    .sg-chat-noauth {
+        flex: 1; display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        padding: 40px; text-align: center; color: #64748b;
+    }
+    .sg-chat-noauth .lock-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.6; }
+    .sg-chat-noauth p { font-size: 14px; margin: 0; line-height: 1.6; }
+    .sg-chat-noauth p strong { color: #38bdf8; }
+    .sg-typing { display: flex; gap: 4px; padding: 8px 14px; }
+    .sg-typing span {
+        width: 7px; height: 7px; border-radius: 50%;
+        background: #38bdf8; opacity: 0.4;
+        animation: sg-bounce 1.4s infinite;
+    }
+    .sg-typing span:nth-child(2) { animation-delay: 0.2s; }
+    .sg-typing span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes sg-bounce {
+        0%, 80%, 100% { transform: translateY(0); opacity: 0.4; }
+        40% { transform: translateY(-8px); opacity: 1; }
+    }
+    `;
+    doc.head.appendChild(style);
+
+    // ── Inject FAB ──────────────────────────────────────────────
+    var fab = doc.createElement('button');
+    fab.id = 'sg-chat-fab';
+    fab.title = 'Cybersecurity Assistant';
+    fab.innerHTML = '<div style="font-size: 26px;">\\uD83D\\uDEE1\\uFE0F</div>';
+    fab.onclick = function() { window.parent.sgToggleChat(); };
+    doc.body.appendChild(fab);
+
+    // ── Inject Chat Window ──────────────────────────────────────
+    var win = doc.createElement('div');
+    win.id = 'sg-chat-window';
+    win.innerHTML = '<div class="sg-chat-header">'
+        + '<div class="sg-chat-header-icon">\\uD83D\\uDEE1\\uFE0F</div>'
+        + '<div class="sg-chat-header-text"><h4>Safeguard-AI Assistant</h4><span>Cybersecurity Expert</span></div>'
+        + '<button class="sg-chat-close" onclick="window.sgToggleChat()">\\u2715</button>'
+        + '</div>'
+        + '%%CHATBODY%%';
+    doc.body.appendChild(win);
+
+    // ── Functions on parent window ──────────────────────────────
+    window.parent.sgToggleChat = function() {
+        window.parent._sgChatOpen = !window.parent._sgChatOpen;
+        var w = doc.getElementById('sg-chat-window');
+        var f = doc.getElementById('sg-chat-fab');
+        if (window.parent._sgChatOpen) {
+            w.classList.add('open');
+            f.style.display = 'none';
+            var inp = doc.getElementById('sg-chat-input');
+            if (inp) setTimeout(function(){ inp.focus(); }, 200);
+        } else {
+            w.classList.remove('open');
+            f.style.display = 'flex';
+        }
+    };
+
+    window.parent.sgAddMessage = function(text, type) {
+        var container = doc.getElementById('sg-chat-messages');
+        if (!container) return;
+        var div = doc.createElement('div');
+        div.className = 'sg-msg ' + type;
+        var html = text
+            .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
+            .replace(/`([^`]+)`/g, '<code>$1</code>')
+            .replace(/\\n/g, '<br>');
+        div.innerHTML = html;
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+    };
+
+    window.parent.sgSendMessage = async function() {
+        var input = doc.getElementById('sg-chat-input');
+        var btn = doc.getElementById('sg-chat-send');
+        if (!input || !btn) return;
+        var msg = input.value.trim();
+        if (!msg) return;
+
+        input.value = '';
+        btn.disabled = true;
+        window.parent.sgAddMessage(msg, 'user');
+
+        if (window.parent._sgChatHistory === undefined) {
+            window.parent._sgChatHistory = [];
+        }
+        var currentHistory = window.parent._sgChatHistory.slice();
+        window.parent._sgChatHistory.push({role: 'user', content: msg});
+
+        // Show typing indicator
+        var container = doc.getElementById('sg-chat-messages');
+        var typing = doc.createElement('div');
+        typing.id = 'sg-typing';
+        typing.className = 'sg-typing';
+        typing.innerHTML = '<span></span><span></span><span></span>';
+        container.appendChild(typing);
+        container.scrollTop = container.scrollHeight;
+
+        try {
+            var resp = await fetch(window.parent._sgApiBase + '/chat', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': 'Bearer ' + window.parent._sgToken
+                },
+                body: JSON.stringify({
+                    message: msg,
+                    context: window.parent._sgContext || {},
+                    history: currentHistory
+                })
+            });
+            var data = await resp.json();
+            var t = doc.getElementById('sg-typing');
+            if (t) t.remove();
+            if (data.reply) {
+                window.parent.sgAddMessage(data.reply, 'bot');
+                window.parent._sgChatHistory.push({role: 'assistant', content: data.reply});
+            } else if (data.detail) {
+                window.parent.sgAddMessage('\\u26A0\\uFE0F ' + data.detail, 'bot');
+            } else {
+                window.parent.sgAddMessage('\\u26A0\\uFE0F Unexpected response from server.', 'bot');
+            }
+        } catch(err) {
+            var t2 = doc.getElementById('sg-typing');
+            if (t2) t2.remove();
+            window.parent.sgAddMessage('\\u26A0\\uFE0F Connection error. Please try again.', 'bot');
+        }
+        btn.disabled = false;
+        input.focus();
+    };
+
+    // Wire up send button
+    var sendBtn = doc.getElementById('sg-chat-send');
+    if (sendBtn) {
+        sendBtn.onclick = function() { window.parent.sgSendMessage(); };
+    }
+
+    // Enter key handler
+    doc.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && window.parent._sgChatOpen && window.parent._sgIsAuthed) {
+            var input = doc.getElementById('sg-chat-input');
+            if (input && doc.activeElement === input) {
+                e.preventDefault();
+                window.parent.sgSendMessage();
+            }
+        }
+    });
+})();
+</script>
+"""
+
+    # Build final HTML — note the %% in CSS are literal % for JS template
+    # but we also use %% as Python-safe percent signs
+    final_js = (
+        injection_js
+        .replace("%%TOKEN%%", auth_token or "")
+        .replace("%%APIBASE%%", api_base)
+        .replace("%%CONTEXT%%", ctx_str)
+        .replace("%%AUTHED%%", "true" if is_authed else "false")
+        .replace("%%CHATBODY%%", chat_body_html.replace("'", "\\'").replace("\n", ""))
+    )
+    components.html(final_js, height=0, width=0, scrolling=False)
+
+
 def render_onboarding_guide() -> None:
     """Render a step-by-step onboarding guide using pure Streamlit widgets."""
 
@@ -1907,6 +2252,9 @@ def main() -> None:
         render_soc_assistant()
     with tabs[9]:
         render_about()
+
+    # ── Floating chatbot widget (always visible) ─────────────────────────────
+    render_chatbot_widget()
 
 
 if __name__ == "__main__":

@@ -213,3 +213,13 @@ class SafeguardAPIClient:
         if response.ok:
             return response.content
         raise APIClientError("Report export failed", status_code=response.status_code)
+
+    def chat(self, message: str, context: dict | None = None) -> dict[str, Any]:
+        """Send a message to the cybersecurity chatbot."""
+        response = requests.post(
+            f"{self.raw_base_url}/chat",
+            headers=self._headers(),
+            json={"message": message, "context": context or {}},
+            timeout=30
+        )
+        return self._handle_response(response)
