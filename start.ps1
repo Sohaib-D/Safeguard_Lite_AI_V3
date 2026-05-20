@@ -47,16 +47,16 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "      Dependencies ready." -ForegroundColor DarkGray
 
-# Step 4: Launch as a single unified process via app.py
+# Step 4: Launch Backend
 Write-Host ""
-Write-Host "[4/4] Launching Safeguard-AI Lite (single process)..." -ForegroundColor Yellow
+Write-Host "[4/4] Launching Safeguard-AI Lite Backend..." -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  App URL -> http://127.0.0.1:8501"      -ForegroundColor Green
 Write-Host "  Backend -> http://127.0.0.1:8000"      -ForegroundColor Green
+Write-Host "  (To run the Next.js frontend, open a new terminal, cd to 'safeguard-ai-frontend', and run 'npm run dev')" -ForegroundColor Green
 Write-Host ""
 Write-Host "Press Ctrl+C to stop."                    -ForegroundColor DarkGray
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
 Set-Location $Root
-& "$VenvPython" -m streamlit run app.py --server.port 8501 --server.address 127.0.0.1
+& "$VenvPython" -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000

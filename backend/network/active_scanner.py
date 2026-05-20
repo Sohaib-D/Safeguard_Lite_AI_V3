@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
+import re
 import whois
 import dns.resolver
 
@@ -36,8 +37,11 @@ class ActiveScanner:
 
     async def scan_target(self, target: str) -> Dict[str, Any]:
         """Perform a full safe reconnaissance scan on a target."""
+        original_target = target
+        target = self._clean_target(target)
         results: Dict[str, Any] = {
             "target": target,
+            "input_target": original_target,
             "timestamp": datetime.utcnow().isoformat(),
             "dns": {},
             "ports": [],
@@ -70,7 +74,14 @@ class ActiveScanner:
             if any(p["port"] in (80, 443, 8000, 8080) for p in results["ports"]):
                 port_to_check = 443 if any(p["port"] == 443 for p in results["ports"]) else 80
                 host_for_http = None if self._is_ip(target) else target
-                results["http_headers"] = await self._get_http_headers(ip_address, port_to_check, host_for_http)
+                raw_headers = await self._get_http_headers(ip_address, port_to_check, host_for_http)
+                # Filter out noisy non-security headers for the "Security Headers" UI section
+                _exclude = {"date", "accept-ranges", "content-encoding", "content-length", "keep-alive", "connection", "vary"}
+                filtered = {k: v for k, v in raw_headers.items() if k.lower() not in _exclude}
+                # Keep both raw and filtered forms for transparency; UI should prefer filtered
+                results["http_headers_raw"] = raw_headers
+                results["http_headers"] = filtered
+                results["http_headers_filtered"] = filtered
 
             # 5. WHOIS (only if it's a domain)
             if not self._is_ip(target):
@@ -79,7 +90,7 @@ class ActiveScanner:
             # 6. Advanced Vulnerability Configuration Checks
             results["security_configs"] = self._evaluate_security(
                 results["ports"], 
-                results["http_headers"], 
+                results.get("http_headers", {}), 
                 results["dns"]
             )
 
@@ -87,6 +98,17 @@ class ActiveScanner:
             results["error"] = str(e)
 
         return results
+
+    def _clean_target(self, target: str) -> str:
+        target = target.strip()
+        if target.startswith("http://") or target.startswith("https://"):
+            parsed = urllib.parse.urlparse(target)
+            target = parsed.netloc
+        if "@" in target:
+            target = target.rsplit("@", 1)[-1]
+        if ":" in target:
+            target = target.split(":", 1)[0]
+        return target.strip("/")
 
     def _is_ip(self, target: str) -> bool:
         try:
@@ -308,18 +330,39 @@ class ActiveScanner:
 
     async def _get_whois(self, domain: str) -> Optional[Dict[str, Any]]:
         loop = asyncio.get_event_loop()
+
+        def _root_domain(d: str) -> str:
+            """Strip subdomains — WHOIS records exist only for root domains."""
+            parts = d.rstrip(".").split(".")
+            # Keep the last two labels (e.g. nmap.org from scanme.nmap.org)
+            # For country-code SLDs like co.uk keep the last three
+            two_label_ccSLDs = {"co", "com", "net", "org", "gov", "edu", "ac"}
+            if len(parts) >= 3 and parts[-2] in two_label_ccSLDs:
+                return ".".join(parts[-3:])
+            return ".".join(parts[-2:]) if len(parts) >= 2 else d
+
         def query_whois():
+            root = _root_domain(domain)
             try:
-                w = whois.whois(domain)
+                w = whois.whois(root)
+                # creation_date / expiration_date can be list or single value or None
+                def _fmt_date(val):
+                    if val is None:
+                        return "N/A"
+                    if isinstance(val, list):
+                        val = val[0]
+                    return str(val)
+
                 return {
-                    "registrar": w.registrar,
-                    "creation_date": str(w.creation_date[0]) if isinstance(w.creation_date, list) else str(w.creation_date),
-                    "expiration_date": str(w.expiration_date[0]) if isinstance(w.expiration_date, list) else str(w.expiration_date),
-                    "name_servers": w.name_servers
+                    "registrar": w.registrar or "N/A",
+                    "creation_date": _fmt_date(w.creation_date),
+                    "expiration_date": _fmt_date(w.expiration_date),
+                    "name_servers": w.name_servers or [],
+                    "root_domain_queried": root,
                 }
             except Exception:
                 return None
-                
+
         return await loop.run_in_executor(None, query_whois)
 
     def _evaluate_security(self, ports: List[Dict[str, Any]], headers: Dict[str, str], dns_info: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -401,27 +444,75 @@ class ActiveScanner:
         # 3. Web Security Headers (XSS, Clickjacking, MitM)
         if headers:
             headers_lower = {k.lower(): v.lower() for k, v in headers.items()}
-            
+
+            # If Server header contains a version string, flag it as disclosed
+            server_val = headers.get('Server') or headers.get('server') or headers_lower.get('server')
+            if server_val and isinstance(server_val, str) and re.search(r"\d", server_val):
+                vulns.append(observation(
+                    "Web Server Version Disclosed",
+                    "Medium",
+                    f"Web server discloses a version string: {server_val}. This information can aid targeted attacks.",
+                    f"server: {server_val}",
+                    0.85,
+                    "HTTP header inspection",
+                ))
+
+            # HSTS: required on HTTPS with High severity if missing
             if 'strict-transport-security' not in headers_lower and 443 in open_port_nums:
                 vulns.append(observation(
                     "Missing HSTS",
-                    "Medium",
+                    "High",
                     "Strict-Transport-Security header was not observed on HTTPS. HSTS is a hardening control against downgrade scenarios; exploitability is not verified.",
                     "HSTS header absent from inspected HTTP response",
                     0.95,
                     "HTTP header inspection",
                 ))
-            
+
+            # Content-Security-Policy: High severity if missing
             if 'content-security-policy' not in headers_lower:
                 vulns.append(observation(
                     "Missing CSP",
-                    "Medium",
+                    "High",
                     "Content-Security-Policy header was not observed. Missing CSP reduces browser-side mitigation but does not prove exploitable XSS.",
                     "CSP header absent from inspected HTTP response",
                     0.96,
                     "HTTP header inspection",
                 ))
-                
+
+            # X-Content-Type-Options: Medium
+            if 'x-content-type-options' not in headers_lower:
+                vulns.append(observation(
+                    "Missing X-Content-Type-Options",
+                    "Medium",
+                    "X-Content-Type-Options header was not observed. This header prevents MIME sniffing attacks.",
+                    "X-Content-Type-Options header absent from inspected HTTP response",
+                    0.92,
+                    "HTTP header inspection",
+                ))
+
+            # Referrer-Policy: Low
+            if 'referrer-policy' not in headers_lower:
+                vulns.append(observation(
+                    "Missing Referrer-Policy",
+                    "Low",
+                    "Referrer-Policy header was not observed. URL data may leak to third parties through Referer headers.",
+                    "Referrer-Policy header absent from inspected HTTP response",
+                    0.8,
+                    "HTTP header inspection",
+                ))
+
+            # Permissions-Policy: Low
+            if 'permissions-policy' not in headers_lower:
+                vulns.append(observation(
+                    "Missing Permissions-Policy",
+                    "Low",
+                    "Permissions-Policy header was not observed. Browser feature access by third-party scripts is not explicitly constrained.",
+                    "Permissions-Policy header absent from inspected HTTP response",
+                    0.8,
+                    "HTTP header inspection",
+                ))
+
+            # X-Frame-Options remains a Low-severity check
             if 'x-frame-options' not in headers_lower:
                 vulns.append(observation(
                     "Missing X-Frame-Options",

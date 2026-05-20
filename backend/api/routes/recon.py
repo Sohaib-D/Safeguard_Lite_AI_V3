@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Body, BackgroundTasks, HTTPException
+from fastapi import APIRouter, Depends, Body, HTTPException
 from fastapi.responses import HTMLResponse
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, field_validator
@@ -51,6 +51,7 @@ async def active_scan(target: str = Body(..., embed=True), current_user: Any = D
 
 
 @router.post("/deep-scan", tags=["Deep Security Scan"])
+# Updated deep scan endpoint only: keep user-facing errors friendly and avoid raw exception output.
 async def deep_scan_target(
     request: DeepScanRequest, 
     current_user: Any = Depends(get_current_user)
@@ -60,7 +61,13 @@ async def deep_scan_target(
         result = await run_deep_scan(request.target, request.quick_scan)
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Deep scan could not be completed.",
+                "reason": type(e).__name__,
+            },
+        )
 
 
 @router.get("/scan-status/{scan_id}", tags=["Deep Security Scan"])

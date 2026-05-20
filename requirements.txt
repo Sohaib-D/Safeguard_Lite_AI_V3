@@ -22,18 +22,15 @@ pandas==2.2.3
 scikit-learn==1.5.2
 shap==0.46.0
 httpx==0.27.2
+cachetools>=5.3.0
 
 # Networking
 scapy==2.5.0
 pyshark==0.6
 dnspython==2.6.1
-python-whois==0.8.0
+python-whois>=0.9.4
 
-# Frontend (for reference)
-streamlit==1.39.0
-matplotlib==3.9.2
-requests==2.32.3
-pyyaml==6.0.2
+# Removed Streamlit Frontend dependencies
 
 # Added for Deep Scanner Modules
 cryptography

@@ -210,62 +210,6 @@ class ModuleScanResult(BaseModel):
     )
 
 
-# Factory function for creating findings
-def create_finding(
-    title: str,
-    category: FindingCategory,
-    severity: Severity,
-    confidence_score: float,
-    evidence_raw: str,
-    evidence_source: str,
-    reasoning: str,
-    detection_method: str,
-    affected_asset: str,
-    remediation: str,
-    references: Optional[list[str]] = None,
-    compliance: Optional[ComplianceMapping] = None,
-) -> Finding:
-    """
-    Factory function to create a Finding with proper evidence structure.
-
-    This function creates a Finding with all required fields, using sensible defaults
-    for the new intelligence fields that will be populated by the intelligence layer.
-    """
-    return Finding(
-        title=title,
-        category=category,
-        severity=severity,
-        confidence_score=confidence_score,
-        evidence=Evidence(
-            raw_data=evidence_raw,
-            source=evidence_source,
-        ),
-        reasoning=reasoning,
-        detection_method=detection_method,
-        affected_asset=affected_asset,
-        remediation=remediation,
-        references=references or [],
-        compliance=compliance,
-        # Intelligence fields - will be populated by SecurityIntelligenceAnalyzer
-        observation_type=ObservationType.INFORMATIONAL,  # Placeholder
-        exploitability=Exploitability.UNKNOWN,  # Placeholder
-        real_world_impact="",  # Will be populated by intelligence layer
-        attack_surface_context="",  # Will be populated by intelligence layer
-        false_positive_risk=FalsePositiveRisk.MEDIUM,  # Placeholder
-    )
-
-    @property
-    def finding_count(self) -> int:
-        return len(self.findings)
-
-    @property
-    def severity_counts(self) -> dict[str, int]:
-        counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Informational": 0}
-        for f in self.findings:
-            counts[f.severity.value] = counts.get(f.severity.value, 0) + 1
-        return counts
-
-
 def confidence_from_score(score: float) -> ConfidenceLevel:
     """Utility to derive confidence level from numeric score."""
     if score >= 0.95:

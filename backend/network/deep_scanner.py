@@ -1,594 +1,1020 @@
 """
-Deep Scanner Orchestrator — Safeguard-AI Lite.
+Enterprise Deep Security Scanner for Safeguard-AI Lite.
 
-Runs all scanner modules concurrently, normalizes results into a
-standardized schema consumed by both the frontend and the
-SecurityIntelligence AI analysis engine.
+The scanner performs non-intrusive reconnaissance only. Every module is
+independent: DNS, ports, HTTP headers, TLS, CORS, WHOIS, technology
+fingerprinting, SSH banner analysis, and NVD CVE cross-reference can fail
+without blocking the rest of the report.
 """
 
+from __future__ import annotations
+
 import asyncio
+import re
 import socket
-import json
-import whois
-import httpx
-from datetime import datetime, timezone
+import ssl
+import time
+from datetime import datetime, timedelta
+from typing import Any
 from urllib.parse import urlparse
-from typing import Dict, Any, Optional
 
-from backend.network.scanner_modules.port_scanner import scan_ports, COMMON_PORTS, CRITICAL_PORTS, HIGH_RISK_PORTS
-from backend.network.scanner_modules.tls_scanner import scan_tls
-from backend.network.scanner_modules.http_scanner import scan_http
-from backend.network.scanner_modules.dns_scanner import scan_dns
-from backend.network.scanner_modules.webapp_scanner import scan_webapp
-from backend.network.scanner_modules.cve_scanner import scan_cve
+import dns.resolver
+import httpx
+import whois
 
-from backend.services.ai_service import AIService
+from backend.network.scanner_modules.port_scanner import (
+    COMMON_PORTS,
+    CRITICAL_PORTS,
+    HIGH_RISK_PORTS,
+    scan_ports,
+)
 
 
-# ═══════════════════════════════════════════════════════════════════
-# HELPERS
-# ═══════════════════════════════════════════════════════════════════
+_CVE_CACHE: dict[str, tuple[datetime, list[dict[str, Any]]]] = {}
 
-async def safe_run(coro, timeout=60.0) -> dict:
-    """Run a coroutine with a timeout; return error dict on failure."""
+REQUIRED_HEADERS = {
+    "strict-transport-security": (
+        "High",
+        "Missing HSTS",
+        "Without HSTS, SSL stripping attacks are possible.",
+        "Add: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
+        15,
+    ),
+    "content-security-policy": (
+        "High",
+        "Missing Content-Security-Policy",
+        "Increases XSS impact because the browser has no content restrictions.",
+        "Deploy CSP. Start with report-only mode, then enforce a policy tailored to the application.",
+        12,
+    ),
+    "x-frame-options": (
+        "Medium",
+        "Missing X-Frame-Options",
+        "Clickjacking may be possible via iframe embedding.",
+        "Add: X-Frame-Options: DENY, or use CSP frame-ancestors.",
+        8,
+    ),
+    "x-content-type-options": (
+        "Medium",
+        "Missing X-Content-Type-Options",
+        "Browsers may MIME-sniff responses, increasing content confusion risk.",
+        "Add: X-Content-Type-Options: nosniff",
+        5,
+    ),
+    "referrer-policy": (
+        "Low",
+        "Missing Referrer-Policy",
+        "URL data may leak to third parties through the Referer header.",
+        "Add: Referrer-Policy: strict-origin-when-cross-origin",
+        3,
+    ),
+    "permissions-policy": (
+        "Low",
+        "Missing Permissions-Policy",
+        "Browser feature access by third-party scripts is not explicitly constrained.",
+        "Add: Permissions-Policy: geolocation=(), camera=(), microphone=()",
+        3,
+    ),
+}
+
+DISCLOSURE_HEADERS = {
+    "server": (
+        "Medium",
+        "Server Version Disclosed",
+        "Reveals web server software/version and can help attackers target known CVEs.",
+        "nginx: server_tokens off; Apache: ServerTokens Prod",
+    ),
+    "x-powered-by": (
+        "Medium",
+        "Technology Stack Disclosed via X-Powered-By",
+        "Reveals backend technology and can help attackers target framework-specific weaknesses.",
+        'PHP: expose_php=Off; Express: app.disable("x-powered-by")',
+    ),
+}
+
+
+def _module_error(module: str, exc: Exception | str) -> dict[str, Any]:
+    reason_key = exc if isinstance(exc, str) else type(exc).__name__
+    friendly_map = {
+        "ConnectError": "Connection refused",
+        "ConnectTimeout": "Connection timed out",
+        "ReadTimeout": "Read timed out",
+        "TimeoutError": "Connection timed out",
+        "gaierror": "DNS resolution failed",
+        "SSLError": "TLS handshake failed",
+        "HTTPError": "HTTP analysis could not be completed",
+        "ProxyError": "Proxy connection failed",
+        "TooManyRedirects": "Too many redirects encountered",
+    }
+    module_label = module.replace("_", " ").title()
+    default_reason = f"{module_label} analysis could not be completed"
+    friendly = friendly_map.get(str(reason_key), default_reason)
+    return {"status": "error", "module": module, "reason": friendly, "findings": []}
+
+
+def clean_target(raw_target: str) -> str:
+    target = raw_target.strip()
+    if target.startswith(("http://", "https://")):
+        parsed = urlparse(target)
+        target = parsed.netloc
+    if "@" in target:
+        target = target.rsplit("@", 1)[-1]
+    target = target.rstrip("/").split("/")[0]
+    if ":" in target and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target):
+        target = target.split(":", 1)[0]
+    if target.startswith("www."):
+        target = target[4:]
+    return target
+
+
+def is_ip_address(target: str) -> bool:
     try:
-        return await asyncio.wait_for(coro, timeout=timeout)
-    except Exception as e:
-        return {"error": str(e), "failed": True, "findings": []}
+        socket.inet_aton(target)
+        return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", target))
+    except OSError:
+        return False
 
 
-def _clean_target(target: str) -> str:
-    """Extract clean hostname from URL/domain input."""
-    clean = target.strip()
-    if clean.startswith("http://") or clean.startswith("https://"):
-        parsed = urlparse(clean)
-        clean = parsed.netloc
-    if ":" in clean:
-        clean = clean.split(":")[0]
-    return clean.strip("/")
-
-
-def _compute_risk_grade(score: int) -> str:
-    """Map a 0–100 risk score to a letter grade (lower = safer)."""
-    if score <= 10:
+def compute_grade(score: int | float) -> str:
+    score = int(score)
+    if score >= 90:
         return "A+"
-    elif score <= 20:
+    if score >= 80:
         return "A"
-    elif score <= 35:
+    if score >= 70:
         return "B"
-    elif score <= 55:
+    if score >= 60:
         return "C"
-    elif score <= 75:
+    if score >= 50:
         return "D"
-    else:
-        return "F"
+    if score >= 40:
+        return "E"
+    return "F"
 
 
-# ═══════════════════════════════════════════════════════════════════
-# WHOIS LOOKUP
-# ═══════════════════════════════════════════════════════════════════
+assert compute_grade(20) == "F"
+assert compute_grade(95) == "A+"
 
-async def _fetch_whois(domain: str) -> dict:
-    """Fetch WHOIS data for a domain."""
-    def sync_whois():
+
+def _finding(
+    severity: str,
+    title: str,
+    description: str,
+    recommendation: str,
+    evidence: str = "",
+    confidence: int = 90,
+    category: str = "configuration",
+    detection_method: str = "passive reconnaissance",
+) -> dict[str, Any]:
+    return {
+        "severity": severity,
+        "title": title,
+        "description": description,
+        "recommendation": recommendation,
+        "remediation": recommendation,
+        "evidence": evidence,
+        "confidence": confidence,
+        "confidence_score": round(confidence / 100, 2),
+        "category": category,
+        "detection_method": detection_method,
+        "exploit_verified": False,
+        "passive_only": True,
+    }
+
+
+async def check_spf(domain: str, is_ip: bool = False) -> dict[str, Any]:
+    if is_ip:
+        return {"skipped": True, "reason": "Target is an IP, DNS checks skipped"}
+
+    def resolve_spf() -> dict[str, Any]:
         try:
-            w = whois.whois(domain)
-            creation = w.creation_date
-            expiration = w.expiration_date
-            if isinstance(creation, list):
-                creation = creation[0]
-            if isinstance(expiration, list):
-                expiration = expiration[0]
+            answers = dns.resolver.resolve(domain, "TXT")
+            records = [r.to_text().strip('"') for r in answers]
+            record = next((r for r in records if "v=spf1" in r.lower()), None)
+            return {"present": record is not None, "record": record}
+        except Exception:
+            return {"present": False, "record": None}
 
-            days_until_expiry = None
-            domain_expiring_soon = False
-            if expiration:
-                delta = expiration - datetime.now()
-                days_until_expiry = delta.days
-                domain_expiring_soon = days_until_expiry < 30
+    return await asyncio.to_thread(resolve_spf)
+
+
+async def check_dmarc(domain: str, is_ip: bool = False) -> dict[str, Any]:
+    if is_ip:
+        return {"skipped": True, "reason": "Target is an IP, DNS checks skipped"}
+
+    def resolve_dmarc() -> dict[str, Any]:
+        try:
+            answers = dns.resolver.resolve(f"_dmarc.{domain}", "TXT")
+            record = answers[0].to_text().strip('"')
+            return {"present": True, "record": record}
+        except Exception:
+            return {"present": False, "record": None}
+
+    return await asyncio.to_thread(resolve_dmarc)
+
+
+async def dns_scan(domain: str, is_ip: bool = False) -> dict[str, Any]:
+    if is_ip:
+        skipped = {"skipped": True, "reason": "Target is an IP, DNS checks skipped"}
+        return {
+            "status": "completed",
+            "module": "dns",
+            "a_records": [],
+            "mx_records": [],
+            "ns_records": [],
+            "spf": skipped,
+            "dmarc": skipped,
+            "findings": [],
+        }
+
+    def resolve_records(record_type: str) -> list[str]:
+        try:
+            return [r.to_text().strip('"') for r in dns.resolver.resolve(domain, record_type)]
+        except Exception:
+            return []
+
+    try:
+        a_task = asyncio.to_thread(resolve_records, "A")
+        mx_task = asyncio.to_thread(resolve_records, "MX")
+        ns_task = asyncio.to_thread(resolve_records, "NS")
+        spf_task = check_spf(domain)
+        dmarc_task = check_dmarc(domain)
+        a_records, mx_records, ns_records, spf, dmarc = await asyncio.gather(
+            a_task, mx_task, ns_task, spf_task, dmarc_task
+        )
+        findings: list[dict[str, Any]] = []
+        if not spf.get("present"):
+            findings.append(
+                _finding(
+                    "Low",
+                    "Missing SPF Record",
+                    "No SPF record was observed. SPF helps receiving mail servers identify authorized senders.",
+                    "Publish an SPF TXT record that includes all legitimate outbound mail providers.",
+                    evidence="TXT lookup did not return a v=spf1 record",
+                    confidence=90,
+                    category="dns",
+                    detection_method="DNS TXT lookup",
+                )
+            )
+        if not dmarc.get("present"):
+            findings.append(
+                _finding(
+                    "Low",
+                    "Missing DMARC Record",
+                    "No DMARC policy was observed. DMARC helps reduce domain spoofing and phishing abuse.",
+                    "Publish a DMARC TXT record at _dmarc with at least p=none, then move toward quarantine or reject.",
+                    evidence="_dmarc TXT lookup did not return a policy",
+                    confidence=90,
+                    category="dns",
+                    detection_method="DNS TXT lookup",
+                )
+            )
+
+        return {
+            "status": "completed",
+            "module": "dns",
+            "a_records": a_records,
+            "mx_records": mx_records,
+            "ns_records": ns_records,
+            "spf": spf,
+            "dmarc": dmarc,
+            "findings": findings,
+        }
+    except Exception as exc:
+        return _module_error("dns", exc)
+
+
+async def port_scan(target: str, quick: bool = True) -> dict[str, Any]:
+    try:
+        raw = await scan_ports(target, quick=quick)
+        banners = raw.get("banners", {})
+        open_ports = []
+        dangerous_ports = []
+        findings = list(raw.get("findings", []))
+
+        for port_info in raw.get("open_ports", []):
+            port = int(port_info.get("port", 0))
+            enriched = {
+                "port": port,
+                "service": port_info.get("service") or COMMON_PORTS.get(port, "Unknown"),
+                "banner": banners.get(port) or banners.get(str(port), ""),
+                "is_dangerous": port in CRITICAL_PORTS,
+                "is_high_risk": port in HIGH_RISK_PORTS,
+            }
+            if enriched["is_dangerous"]:
+                dangerous_ports.append(enriched)
+            open_ports.append(enriched)
+
+        return {
+            "status": "completed",
+            "module": "ports",
+            "open_ports": open_ports,
+            "dangerous_ports": dangerous_ports,
+            "critical_ports": raw.get("critical_ports", []),
+            "high_risk_ports": raw.get("high_risk_ports", []),
+            "banners": banners,
+            "open_count": len(open_ports),
+            "total_open": len(open_ports),
+            "total_scanned": raw.get("total_scanned", 0),
+            "scan_duration_seconds": raw.get("scan_duration_seconds", 0),
+            "findings": findings,
+        }
+    except Exception as exc:
+        return _module_error("ports", exc)
+
+
+async def http_headers_scan(url: str) -> dict[str, Any]:
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True, verify=False) as client:
+            response = await client.get(url)
+            headers_raw = dict(response.headers)
+            headers = {k.lower(): v for k, v in headers_raw.items()}
+            findings: list[dict[str, Any]] = []
+            missing_count = 0
+            critical_missing = 0
+            score_deductions = 0
+
+            for header, (severity, title, description, recommendation, weight) in REQUIRED_HEADERS.items():
+                if header not in headers:
+                    missing_count += 1
+                    score_deductions += weight
+                    if severity in ("Critical", "High"):
+                        critical_missing += 1
+                    findings.append(
+                        _finding(
+                            severity,
+                            title,
+                            description,
+                            recommendation,
+                            evidence=f"{header} header absent from {response.url}",
+                            confidence=95,
+                            category="headers",
+                            detection_method="HTTP header inspection",
+                        )
+                    )
+
+            for header, (severity, title, description, recommendation) in DISCLOSURE_HEADERS.items():
+                value = headers.get(header)
+                if value and (header != "server" or re.search(r"\d", value)):
+                    findings.append(
+                        _finding(
+                            severity,
+                            title,
+                            description,
+                            recommendation,
+                            evidence=f"{header}: {value}",
+                            confidence=95,
+                            category="information_disclosure",
+                            detection_method="HTTP header inspection",
+                        )
+                    )
+
+            x_xss = headers.get("x-xss-protection")
+            if x_xss and x_xss.strip() != "0":
+                findings.append(
+                    _finding(
+                        "Info",
+                        "Outdated X-XSS-Protection Header Present",
+                        "X-XSS-Protection is obsolete and can introduce browser-specific issues.",
+                        "Remove X-XSS-Protection and rely on a strong Content-Security-Policy.",
+                        evidence=f"x-xss-protection: {x_xss}",
+                        confidence=95,
+                        category="headers",
+                        detection_method="HTTP header inspection",
+                    )
+                )
 
             return {
                 "status": "completed",
+                "module": "http_headers",
+                "headers_raw": headers_raw,
+                "headers": headers_raw,
+                "findings": findings,
+                "missing_count": missing_count,
+                "critical_missing": critical_missing,
+                "score_deductions": score_deductions,
+                "url_scanned": str(response.url),
+                "response_status": response.status_code,
+            }
+    except Exception as exc:
+        error = _module_error("http_headers", exc)
+        error.update({"missing_count": 0, "critical_missing": 0, "score_deductions": 0})
+        return error
+
+
+async def cors_check(url: str) -> dict[str, Any]:
+    evil = "https://evil-attacker.example.com"
+    try:
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True, verify=False) as client:
+            response = await client.get(url, headers={"Origin": evil})
+            acao = response.headers.get("access-control-allow-origin", "")
+            acac = response.headers.get("access-control-allow-credentials", "")
+            issues: list[dict[str, Any]] = []
+            if acao == "*":
+                issues.append(
+                    _finding(
+                        "Medium",
+                        "CORS Wildcard Origin",
+                        "Any website can make cross-origin requests and read responses where CORS applies.",
+                        "Replace wildcard origin with an explicit allowlist of trusted origins.",
+                        evidence="Access-Control-Allow-Origin: *",
+                        category="cors",
+                        detection_method="CORS probe",
+                    )
+                )
+            if acao == evil:
+                issues.append(
+                    _finding(
+                        "High",
+                        "CORS Reflects Arbitrary Origin",
+                        "Server reflects the requesting Origin header verbatim.",
+                        "Implement a strict origin whitelist and reject untrusted origins.",
+                        evidence=f"Reflected Origin: {evil}",
+                        category="cors",
+                        detection_method="CORS probe",
+                    )
+                )
+            if (acao == "*" or acao == evil) and "true" in acac.lower():
+                issues.append(
+                    _finding(
+                        "Critical",
+                        "CORS: Credentials Exposed to Arbitrary Origin",
+                        "Allow-Credentials:true with permissive origin allows authenticated cross-origin requests.",
+                        "Never combine Allow-Credentials:true with wildcard or reflected origins.",
+                        evidence=f"ACAO: {acao}; ACAC: {acac}",
+                        category="cors",
+                        detection_method="CORS probe",
+                    )
+                )
+            return {"status": "completed", "module": "cors", "acao": acao, "credentials": acac, "issues": issues}
+    except Exception as exc:
+        error = _module_error("cors", exc)
+        error["issues"] = []
+        return error
+
+
+async def tls_deep_check(hostname: str) -> dict[str, Any]:
+    results: dict[str, Any] = {
+        "status": "completed",
+        "module": "ssl",
+        "protocols": {},
+        "cipher": None,
+        "cert": {},
+        "issues": [],
+        "findings": [],
+    }
+
+    protocol_versions = []
+    if hasattr(ssl, "TLSVersion"):
+        protocol_versions = [
+            ("TLS 1.0", ssl.TLSVersion.TLSv1),
+            ("TLS 1.1", ssl.TLSVersion.TLSv1_1),
+            ("TLS 1.2", ssl.TLSVersion.TLSv1_2),
+            ("TLS 1.3", ssl.TLSVersion.TLSv1_3),
+        ]
+
+    def test_protocol(name: str, version: ssl.TLSVersion) -> str:
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.maximum_version = version
+            ctx.minimum_version = version
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((hostname, 443), timeout=5) as sock:
+                with ctx.wrap_socket(sock, server_hostname=hostname):
+                    return "supported"
+        except Exception:
+            return "not supported"
+
+    for name, version in protocol_versions:
+        status = await asyncio.to_thread(test_protocol, name, version)
+        results["protocols"][name] = status
+        if status == "supported" and name in ("TLS 1.0", "TLS 1.1"):
+            results["issues"].append(
+                _finding(
+                    "High",
+                    f"{name} Enabled - Deprecated Protocol",
+                    f"{name} is deprecated per RFC 8996 and should be disabled.",
+                    "nginx: ssl_protocols TLSv1.2 TLSv1.3; Apache: SSLProtocol -all +TLSv1.2 +TLSv1.3",
+                    evidence=f"{name} handshake succeeded",
+                    category="tls",
+                    detection_method="TLS protocol negotiation",
+                )
+            )
+
+    def get_certificate() -> dict[str, Any]:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((hostname, 443), timeout=8) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert = ssock.getpeercert()
+                cipher = ssock.cipher()
+                cert_info: dict[str, Any] = {}
+                days_left = 999
+                if cert and cert.get("notAfter"):
+                    expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                    days_left = (expiry - datetime.utcnow()).days
+                    cert_info = {
+                        "issuer": dict(x[0] for x in cert.get("issuer", [])),
+                        "expires": cert["notAfter"],
+                        "days_until_expiry": days_left,
+                        "san": [x[1] for x in cert.get("subjectAltName", [])],
+                    }
+                return {
+                    "cipher": {"name": cipher[0], "protocol": cipher[1], "bits": cipher[2]} if cipher else None,
+                    "cert": cert_info,
+                    "days_left": days_left,
+                }
+
+    try:
+        cert_data = await asyncio.to_thread(get_certificate)
+        results["cipher"] = cert_data.get("cipher")
+        results["cert"] = cert_data.get("cert", {})
+        days_left = cert_data.get("days_left", 999)
+        if days_left < 0:
+            results["issues"].append(
+                _finding(
+                    "Critical",
+                    "SSL Certificate Expired",
+                    f"Certificate expired {abs(days_left)} days ago. Visitors will see browser errors.",
+                    "Renew immediately: certbot renew --force-renewal",
+                    evidence=f"days_until_expiry={days_left}",
+                    category="tls",
+                    detection_method="certificate inspection",
+                )
+            )
+        elif days_left < 14:
+            results["issues"].append(
+                _finding(
+                    "High",
+                    f"Certificate Expiring in {days_left} Days",
+                    "Imminent expiry will cause browser warnings and broken HTTPS.",
+                    "Renew now: certbot renew --force-renewal",
+                    evidence=f"days_until_expiry={days_left}",
+                    category="tls",
+                    detection_method="certificate inspection",
+                )
+            )
+        elif days_left < 30:
+            results["issues"].append(
+                _finding(
+                    "Medium",
+                    f"Certificate Expiring in {days_left} Days",
+                    "Certificate renewal is due soon.",
+                    "Schedule renewal this week.",
+                    evidence=f"days_until_expiry={days_left}",
+                    category="tls",
+                    detection_method="certificate inspection",
+                )
+            )
+    except Exception as exc:
+        results["status"] = "error"
+        results["reason"] = "No valid SSL/TLS certificate"
+        results["cert_error"] = type(exc).__name__
+        results["issues"].append(
+            _finding(
+                "High",
+                "No Valid SSL/TLS Certificate",
+                "TLS certificate details could not be validated from port 443.",
+                "Install and configure a valid certificate for the target hostname.",
+                evidence="TLS certificate probe failed",
+                category="tls",
+                detection_method="TLS certificate probe",
+            )
+        )
+
+    results["findings"] = results["issues"]
+    return results
+
+
+async def whois_scan(domain: str, is_ip: bool = False) -> dict[str, Any]:
+    if is_ip:
+        return {"status": "skipped", "module": "whois", "reason": "Target is an IP, WHOIS domain checks skipped"}
+
+    def run_whois() -> dict[str, Any]:
+        try:
+            w = whois.whois(domain)
+            creation = w.creation_date[0] if isinstance(w.creation_date, list) else w.creation_date
+            expiry = w.expiration_date[0] if isinstance(w.expiration_date, list) else w.expiration_date
+            days_until_expiry = None
+            if expiry:
+                days_until_expiry = (expiry - datetime.utcnow()).days
+            return {
+                "status": "completed",
+                "module": "whois",
                 "registrar": w.registrar or "N/A",
                 "creation_date": str(creation) if creation else "N/A",
-                "expiry_date": str(expiration) if expiration else "N/A",
+                "expiry_date": str(expiry) if expiry else "N/A",
                 "days_until_expiry": days_until_expiry,
-                "domain_expiring_soon": domain_expiring_soon,
-                "name_servers": w.name_servers if w.name_servers else [],
+                "name_servers": w.name_servers or [],
                 "org": w.org or "N/A",
                 "country": w.country or "N/A",
             }
-        except Exception as e:
-            return {"status": "failed", "error": str(e)}
+        except Exception as exc:
+            return _module_error("whois", exc)
 
-    return await asyncio.to_thread(sync_whois)
-
-
-# ═══════════════════════════════════════════════════════════════════
-# SCHEMA NORMALIZATION — Translates raw module dicts into the
-# standardized shape expected by the frontend + SecurityIntelligence.
-# ═══════════════════════════════════════════════════════════════════
-
-def _normalize_ports(raw: dict) -> dict:
-    """Normalize port_scanner output → `ports` section."""
-    if raw.get("failed"):
-        return {"status": "failed", "error": raw.get("error", "Unknown")}
-
-    open_ports = raw.get("open_ports", [])
-    banners = raw.get("banners", {})
-    dangerous_open = []
-
-    enriched = []
-    for p in open_ports:
-        port_num = p["port"]
-        service = p.get("service", COMMON_PORTS.get(port_num, "Unknown"))
-        banner = banners.get(port_num, "") if isinstance(banners.get(port_num), str) else banners.get(str(port_num), "")
-        is_dangerous = port_num in CRITICAL_PORTS
-        is_high_risk = port_num in HIGH_RISK_PORTS
-
-        risk_desc = "Standard service port"
-        if is_dangerous:
-            risk_desc = f"CRITICAL — {service} is frequently targeted by attackers"
-        elif is_high_risk:
-            risk_desc = f"Elevated risk — {service} requires strong authentication"
-
-        entry = {
-            "port": port_num,
-            "service": service,
-            "banner": banner,
-            "is_dangerous": is_dangerous,
-            "is_high_risk": is_high_risk,
-            "risk_description": risk_desc,
-        }
-        enriched.append(entry)
-        if is_dangerous:
-            dangerous_open.append(entry)
-
-    return {
-        "status": "completed",
-        "open_ports": enriched,
-        "open_count": len(enriched),
-        "total_scanned": raw.get("total_scanned", 1024),
-        "dangerous_open": dangerous_open,
-        "scan_duration_seconds": raw.get("scan_duration_seconds", 0),
-    }
+    return await asyncio.to_thread(run_whois)
 
 
-def _normalize_ssl(raw: dict) -> dict:
-    """Normalize tls_scanner output → `ssl` section."""
-    if raw.get("failed") or raw.get("has_error"):
-        return {
-            "status": "failed",
-            "error": raw.get("error_message") or raw.get("error", "TLS connection failed"),
-        }
-
-    # Compute health score
-    health = 100
-    findings = raw.get("findings", [])
-    for f in findings:
-        sev = f.get("severity", "").lower()
-        if sev == "critical":
-            health -= 30
-        elif sev == "high":
-            health -= 20
-        elif sev == "medium":
-            health -= 10
-        elif sev == "low":
-            health -= 5
-    health = max(0, health)
-
-    protocol_ver = raw.get("protocol_version", "Unknown")
-    risk_level = "excellent"
-    if "1.3" in protocol_ver:
-        risk_level = "excellent"
-    elif "1.2" in protocol_ver:
-        risk_level = "ok"
-    elif "1.1" in protocol_ver or "1.0" in protocol_ver:
-        risk_level = "vulnerable"
-    elif "SSL" in protocol_ver.upper():
-        risk_level = "critical"
-
-    cipher_name = raw.get("cipher_suite", "Unknown")
-
-    return {
-        "status": "completed",
-        "health_score": health,
-        "certificate": {
-            "is_valid": raw.get("is_valid", False),
-            "is_self_signed": raw.get("is_self_signed", False),
-            "is_expired": raw.get("days_until_expiry", 1) <= 0,
-            "days_remaining": raw.get("days_until_expiry", 0),
-            "domain_match": raw.get("domain_match", False),
-            "subject": {"commonName": "N/A"},
-            "issuer": {"organizationName": "N/A"},
-            "valid_from": "N/A",
-            "valid_to": "N/A",
-        },
-        "protocol": {
-            "version": protocol_ver,
-            "risk_level": risk_level,
-        },
-        "cipher": {
-            "name": cipher_name,
-            "bits": 256 if "256" in cipher_name or "CHACHA" in cipher_name.upper() else 128,
-            "strength": "strong" if health >= 70 else "weak",
-        },
-        "hsts_enabled": raw.get("hsts_enabled", False),
-        "findings": findings,
-    }
-
-
-def _normalize_headers(raw: dict) -> dict:
-    """Normalize http_scanner output → `http_headers` section."""
-    if raw.get("failed"):
-        return {"status": "failed", "error": raw.get("error", "Unknown")}
-
-    EXPECTED_HEADERS = [
-        "Content-Security-Policy",
-        "X-Frame-Options",
-        "X-Content-Type-Options",
-        "Strict-Transport-Security",
-        "Referrer-Policy",
-        "Permissions-Policy",
-    ]
-    missing = raw.get("missing_security_headers", [])
-    found = raw.get("headers_found", {})
-
-    header_analysis = {}
-    critical_missing = 0
-    for h in EXPECTED_HEADERS:
-        h_lower = h.lower()
-        is_present = h not in missing
-        risk = "Low"
-        if h in ("Content-Security-Policy", "Strict-Transport-Security"):
-            risk = "Critical"
-        elif h in ("X-Frame-Options",):
-            risk = "High"
-        elif h in ("X-Content-Type-Options", "Referrer-Policy"):
-            risk = "Medium"
-
-        if not is_present and risk in ("Critical", "High"):
-            critical_missing += 1
-
-        header_analysis[h] = {
-            "is_present": is_present,
-            "value": found.get(h.lower()) or found.get(h, None),
-            "risk_level": risk,
-        }
-
-    return {
-        "status": "completed",
-        "response_status": 200,
-        "headers": header_analysis,
-        "raw_headers": found,
-        "total_missing": len(missing),
-        "missing_critical_count": critical_missing,
-        "cors_issues": raw.get("cors_issues", []),
-        "cookie_issues": raw.get("cookie_issues", []),
-        "dangerous_methods": raw.get("dangerous_methods", []),
-        "sensitive_files": raw.get("sensitive_files_found", []),
-        "findings": raw.get("findings", []),
-    }
-
-
-def _normalize_dns(raw: dict) -> dict:
-    """Normalize dns_scanner output → `dns` section."""
-    if raw.get("failed"):
-        return {"status": "failed", "error": raw.get("error", "Unknown")}
-
-    return {
-        "status": "completed",
-        "a_records": [],  # dns_scanner doesn't return A records explicitly
-        "mx_records": raw.get("mx_records", []),
-        "ns_records": raw.get("ns_records", []),
-        "txt_records": [],
-        "spf_status": raw.get("spf_status", "Unknown"),
-        "dkim_found": raw.get("dkim_found", False),
-        "dmarc_policy": raw.get("dmarc_policy", "Unknown"),
-        "dnssec_enabled": raw.get("dnssec_enabled", False),
-        "zone_transfer": {
-            "successful": raw.get("zone_transfer_possible", False),
-        },
-        "subdomains_found": raw.get("subdomains_found", []),
-        "takeover_risks": raw.get("takeover_risks", []),
-        "findings": raw.get("findings", []),
-    }
-
-
-def _normalize_technologies(raw_http: dict, raw_webapp: dict) -> dict:
-    """Build `technologies` section from HTTP + webapp scanner outputs."""
-    if raw_webapp.get("failed") and raw_http.get("failed"):
-        return {"status": "failed", "error": "Scan failed"}
-
-    found_headers = raw_http.get("headers_found", {}) if not raw_http.get("failed") else {}
-    server = None
-    framework = None
-    for k, v in found_headers.items():
-        kl = k.lower()
-        if kl == "server":
-            server = v
-        elif kl == "x-powered-by":
-            framework = v
-
-    cms = raw_webapp.get("cms_detected") if not raw_webapp.get("failed") else None
-
-    # Detect CDN/WAF from headers
-    cdn = None
-    waf_detected = False
-    waf_name = None
-    for k, v in found_headers.items():
-        kl = k.lower()
-        vl = str(v).lower() if v else ""
-        if "cf-ray" in kl or "cloudflare" in vl:
-            cdn = "Cloudflare"
-            waf_detected = True
-            waf_name = "Cloudflare WAF"
-        elif "x-cdn" in kl or "x-cache" in kl:
-            cdn = v
-        elif "x-sucuri" in kl:
-            waf_detected = True
-            waf_name = "Sucuri WAF"
-
-    version_risks = []
-    if server and any(c.isdigit() for c in server):
-        version_risks.append({
-            "component": "Server",
-            "detail": f"Server header exposes version: {server}",
-        })
-    if framework:
-        version_risks.append({
-            "component": "Framework",
-            "detail": f"X-Powered-By exposes technology: {framework}",
-        })
-
-    return {
-        "status": "completed",
-        "web_server": server,
-        "backend_framework": framework,
-        "cms": cms,
-        "cdn": cdn,
-        "waf_detected": waf_detected,
-        "waf_name": waf_name,
-        "version_risks": version_risks,
-        "csrf_issues": raw_webapp.get("csrf_issues", []) if not raw_webapp.get("failed") else [],
-        "error_disclosure": raw_webapp.get("error_disclosure", False) if not raw_webapp.get("failed") else False,
-        "mixed_content": raw_webapp.get("mixed_content_found", False) if not raw_webapp.get("failed") else False,
-        "dangerous_js": raw_webapp.get("dangerous_js_patterns", []) if not raw_webapp.get("failed") else [],
-    }
-
-
-def _normalize_full_result(
-    target: str,
-    clean_target: str,
-    resolved_ip: Optional[str],
-    quick: bool,
-    raw_ports: dict,
-    raw_tls: dict,
-    raw_http: dict,
-    raw_dns: dict,
-    raw_webapp: dict,
-    raw_cve: dict,
-    raw_whois: dict,
-) -> dict:
-    """
-    Translate all raw module outputs into the standardized schema
-    consumed by the frontend and SecurityIntelligence engine.
-    """
-    ports = _normalize_ports(raw_ports)
-    ssl = _normalize_ssl(raw_tls)
-    http_headers = _normalize_headers(raw_http)
-    dns = _normalize_dns(raw_dns)
-    technologies = _normalize_technologies(raw_http, raw_webapp)
-    whois_data = raw_whois
-
-    # ── Aggregate all findings for scoring ──
-    all_findings = []
-    for section in [raw_ports, raw_tls, raw_http, raw_dns, raw_webapp, raw_cve]:
-        if section and not section.get("failed"):
-            all_findings.extend(section.get("findings", []))
-
-    # ── Generate structural findings from normalized data ──
-    # SSL failure — Confirmed observation
-    if ssl.get("status") == "failed":
-        all_findings.append({
-            "severity": "High",
-            "title": "SSL/TLS Not Properly Configured",
-            "category": "Security Weakness",
-            "description": f"SSL/TLS connection could not be established, indicating misconfiguration or missing certificate.",
-            "technical_detail": f"Error: {ssl.get('error', 'Unknown')}",
-            "confidence_score": 0.95,
-            "evidence": "TLS handshake failed during passive connection attempt",
-            "detection_method": "TLS connect probe",
-            "severity_justification": "Without HTTPS, all traffic is susceptible to interception",
-            "exploit_verified": False,
-            "remediation": "Install and configure a valid SSL certificate. Use Let's Encrypt for free certificates.",
-            "references": ["A02:2021 – Cryptographic Failures"],
-        })
-
-    # Dangerous open ports — Confirmed observation
-    for dp in ports.get("dangerous_open", []):
-        all_findings.append({
-            "severity": "High",
-            "title": f"Externally Accessible Service: {dp['port']} ({dp['service']})",
-            "category": "Confirmed Finding",
-            "description": f"Port {dp['port']} ({dp['service']}) is externally reachable. This service is frequently targeted in attacks.",
-            "confidence_score": 0.95,
-            "evidence": f"TCP connection to port {dp['port']} succeeded",
-            "detection_method": "TCP connect scan",
-            "severity_justification": dp.get("risk_description", "Service commonly targeted by automated scanners"),
-            "exploit_verified": False,
-            "remediation": f"Restrict access to port {dp['port']} via firewall rules or VPN if not publicly needed.",
-        })
-
-    # Missing critical security headers — Security Weakness
-    if http_headers.get("status") == "completed":
-        mc = http_headers.get("missing_critical_count", 0)
-        if mc > 0:
-            all_findings.append({
-                "severity": "Medium",
-                "title": f"{mc} Critical Security Header(s) Missing",
-                "category": "Security Weakness",
-                "description": "Absence of headers such as CSP or HSTS reduces browser-side mitigation against common attacks.",
-                "confidence_score": 0.96,
-                "evidence": "HTTP response headers inspected; critical headers absent",
-                "detection_method": "HTTP header analysis",
-                "severity_justification": "Risk depends on existence of exploitable vectors (e.g., XSS sinks)",
-                "exploit_verified": False,
-                "remediation": "Configure Content-Security-Policy, Strict-Transport-Security, and X-Frame-Options headers.",
-                "references": ["A05:2021 – Security Misconfiguration"],
-            })
-
-    # Domain expiring soon — Informational
-    if whois_data.get("status") == "completed" and whois_data.get("domain_expiring_soon"):
-        all_findings.append({
-            "severity": "High",
-            "title": "Domain Registration Expiring Soon",
-            "category": "Informational",
-            "description": f"Domain registration expires in {whois_data.get('days_until_expiry', '?')} days. Failure to renew could lead to domain hijacking.",
-            "confidence_score": 0.90,
-            "evidence": "WHOIS expiry date queried",
-            "detection_method": "WHOIS lookup",
-            "severity_justification": "Expired domains can be re-registered by attackers",
-            "exploit_verified": False,
-            "remediation": "Renew the domain registration and enable auto-renewal.",
-        })
-
-    critical = sum(1 for f in all_findings if str(f.get("severity", "")).lower() == "critical")
-    high = sum(1 for f in all_findings if str(f.get("severity", "")).lower() == "high")
-    medium = sum(1 for f in all_findings if str(f.get("severity", "")).lower() == "medium")
-    low = sum(1 for f in all_findings if str(f.get("severity", "")).lower() == "low")
-
-    # Risk score with confidence weighting (higher = worse)
-    raw_score = (critical * 25) + (high * 15) + (medium * 8) + (low * 3)
-    # Apply average confidence as a weight — lower confidence = lower score
-    avg_confidence = 0.85  # baseline for passive recon
-    if all_findings:
-        scores = [f.get("confidence_score", 0.7) for f in all_findings]
-        avg_confidence = sum(scores) / len(scores)
-    risk_score = min(100, int(raw_score * avg_confidence))
-    risk_grade = _compute_risk_grade(risk_score)
-
-    # Critical findings (human-readable)
-    critical_findings = [
-        f"[{f.get('severity')}] {f.get('title', 'Unknown')}: {f.get('description', '')[:120]}"
-        for f in all_findings
-        if str(f.get("severity", "")).lower() in ("critical", "high")
-    ]
-
-    return {
-        "target": target,
-        "clean_target": clean_target,
-        "resolved_ip": resolved_ip,
-        "quick_scan": quick,
-        "scan_timestamp": datetime.now(timezone.utc).isoformat(),
-
-        # ── Standardized top-level keys ──
-        "overall_risk_score": risk_score,
-        "risk_grade": risk_grade,
-        "severity_counts": {
-            "critical": critical,
-            "high": high,
-            "medium": medium,
-            "low": low,
-        },
-        "critical_findings": critical_findings,
-        "total_findings": len(all_findings),
-
-        # ── Standardized sections ──
-        "ports": ports,
-        "ssl": ssl,
-        "http_headers": http_headers,
-        "dns": dns,
-        "technologies": technologies,
-        "whois": whois_data,
-        "cve_scan": raw_cve if not raw_cve.get("failed") else {"findings": []},
-
-        # ── Raw module data (for export / debugging) ──
-        "raw_modules": {
-            "port_scan": raw_ports,
-            "tls_scan": raw_tls,
-            "http_scan": raw_http,
-            "dns_scan": raw_dns,
-            "webapp_scan": raw_webapp,
-            "cve_scan": raw_cve,
-        },
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MAIN SCAN ORCHESTRATOR
-# ═══════════════════════════════════════════════════════════════════
-
-async def run_deep_scan(target: str, quick: bool = True) -> dict:
-    """
-    Run all scanner modules concurrently, normalize results,
-    and return a standardized result dictionary.
-    """
-    clean_target = _clean_target(target)
-
-    # Resolve IP
-    resolved_ip = None
+async def tech_fingerprint(url: str) -> dict[str, Any]:
     try:
-        resolved_ip = await asyncio.to_thread(socket.gethostbyname, clean_target)
-    except Exception:
-        pass
+        async with httpx.AsyncClient(timeout=8, follow_redirects=True, verify=False) as client:
+            response = await client.get(url)
+            headers = {k.lower(): v for k, v in response.headers.items()}
+            technologies: list[dict[str, Any]] = []
+            server = headers.get("server")
+            powered_by = headers.get("x-powered-by")
+            if server:
+                technologies.append({"name": "Web Server", "value": server, "version": _extract_first_version(server)})
+            if powered_by:
+                technologies.append({"name": "X-Powered-By", "value": powered_by, "version": _extract_first_version(powered_by)})
+            return {
+                "status": "completed",
+                "module": "technologies",
+                "server": server,
+                "x_powered_by": powered_by,
+                "technologies": technologies,
+            }
+    except Exception as exc:
+        error = _module_error("technologies", exc)
+        error["technologies"] = []
+        return error
 
-    # Run all modules concurrently
-    # Use resolved IP for port scanning (bypasses CDN port filtering),
-    # matching the Active Scanner's approach.  Fall back to domain if
-    # DNS resolution failed.
-    port_scan_target = resolved_ip if resolved_ip else clean_target
-    port_task = safe_run(scan_ports(port_scan_target, quick=quick), timeout=90)
-    tls_task = safe_run(scan_tls(clean_target, port=443))
-    http_task = safe_run(scan_http(target))
-    dns_task = safe_run(scan_dns(clean_target))
-    webapp_task = safe_run(scan_webapp(target))
-    whois_task = safe_run(_fetch_whois(clean_target), timeout=15)
 
-    port_res, tls_res, http_res, dns_res, webapp_res, whois_res = await asyncio.gather(
-        port_task, tls_task, http_task, dns_task, webapp_task, whois_task
-    )
+def _extract_first_version(value: str | None) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"(\d+(?:\.\d+){1,3})", value)
+    return match.group(1) if match else None
 
-    # CVE scan needs banners + detected software (synchronous)
-    banners = port_res.get("banners", {}) if not port_res.get("failed") else {}
-    software = []
-    if not webapp_res.get("failed"):
-        cms = webapp_res.get("cms_detected")
-        if cms:
-            software.append(cms)
-    if not http_res.get("failed"):
-        headers = http_res.get("headers_found", {})
-        for key in ("server", "x-powered-by", "x-aspnet-version"):
-            val = headers.get(key)
-            if val:
-                software.append(val)
 
-    cve_res = scan_cve(banners, software)
+def parse_ssh_banner(banner: str) -> dict[str, Any]:
+    result: dict[str, Any] = {"raw": banner, "software": None, "version": None, "os": None, "eol": False}
+    if "OpenSSH_" in banner:
+        result["software"] = "OpenSSH"
+        result["version"] = banner.split("OpenSSH_")[1].split(" ")[0]
 
-    # Normalize into standardized schema
-    result = _normalize_full_result(
-        target=target,
-        clean_target=clean_target,
-        resolved_ip=resolved_ip,
-        quick=quick,
-        raw_ports=port_res,
-        raw_tls=tls_res,
-        raw_http=http_res,
-        raw_dns=dns_res,
-        raw_webapp=webapp_res,
-        raw_cve=cve_res,
-        raw_whois=whois_res,
-    )
-
+    ubuntu_map = {
+        "2ubuntu2": ("Ubuntu 14.04 LTS (Trusty)", True),
+        "2ubuntu1": ("Ubuntu 16.04 LTS (Xenial)", True),
+        "1ubuntu3": ("Ubuntu 18.04 LTS (Bionic)", True),
+        "3ubuntu0": ("Ubuntu 20.04 LTS (Focal)", False),
+        "3ubuntu13": ("Ubuntu 22.04 LTS (Jammy)", False),
+    }
+    for pkg, (name, eol) in ubuntu_map.items():
+        if pkg in banner:
+            result["os"] = name
+            result["eol"] = eol
+            break
     return result
 
 
-def run_scan_sync(target: str, quick: bool = True) -> dict:
-    return asyncio.run(run_deep_scan(target, quick))
+async def fetch_cves(product: str, version: str) -> list[dict[str, Any]]:
+    key = f"{product}:{version}"
+    if key in _CVE_CACHE:
+        ts, data = _CVE_CACHE[key]
+        if datetime.utcnow() - ts < timedelta(hours=24):
+            return data
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(
+                "https://services.nvd.nist.gov/rest/json/cves/2.0",
+                params={"keywordSearch": f"{product} {version}", "resultsPerPage": 10},
+            )
+            response.raise_for_status()
+            data = response.json()
+            cves = []
+            for item in data.get("vulnerabilities", []):
+                cve = item.get("cve", {})
+                metrics = cve.get("metrics", {})
+                cvss = (
+                    metrics.get("cvssMetricV31", [{}])[0].get("cvssData", {})
+                    or metrics.get("cvssMetricV30", [{}])[0].get("cvssData", {})
+                    or metrics.get("cvssMetricV2", [{}])[0].get("cvssData", {})
+                )
+                score = float(cvss.get("baseScore", 0) or 0)
+                if score >= 6.0:
+                    cve_id = cve.get("id")
+                    descriptions = cve.get("descriptions", [{}])
+                    cves.append(
+                        {
+                            "cve_id": cve_id,
+                            "cvss_score": score,
+                            "severity": cvss.get("baseSeverity", "UNKNOWN"),
+                            "description": descriptions[0].get("value", "") if descriptions else "",
+                            "published": cve.get("published", ""),
+                            "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
+                        }
+                    )
+            _CVE_CACHE[key] = (datetime.utcnow(), cves)
+            return cves
+    except Exception:
+        return []
+
+
+def calculate_security_score(all_results: dict[str, Any]) -> tuple[int, str, list[dict[str, Any]]]:
+    score = 100
+    deductions: list[dict[str, Any]] = []
+
+    def deduct(points: int, reason: str) -> None:
+        nonlocal score
+        if points <= 0:
+            return
+        score -= points
+        deductions.append({"reason": reason, "points": points})
+
+    ssl_result = all_results.get("ssl", {})
+    if ssl_result.get("status") == "error" or ssl_result.get("cert_error"):
+        deduct(20, "No valid SSL/TLS certificate")
+    if ssl_result.get("protocols", {}).get("TLS 1.0") == "supported":
+        deduct(10, "TLS 1.0 enabled")
+    if ssl_result.get("protocols", {}).get("TLS 1.1") == "supported":
+        deduct(8, "TLS 1.1 enabled")
+    days_left = ssl_result.get("cert", {}).get("days_until_expiry", 999)
+    if days_left < 0:
+        deduct(25, "SSL certificate expired")
+    elif days_left < 14:
+        deduct(15, "SSL certificate expiring < 14 days")
+    elif days_left < 30:
+        deduct(8, "SSL certificate expiring < 30 days")
+
+    headers = all_results.get("headers", {})
+    deduct(min(headers.get("score_deductions", 0), 40), "Missing security headers")
+
+    dangerous_open = all_results.get("ports", {}).get("dangerous_ports", [])
+    deduct(min(len(dangerous_open) * 12, 30), f"{len(dangerous_open)} dangerous port(s) open")
+
+    dns_result = all_results.get("dns", {})
+    if not dns_result.get("spf", {}).get("present") and not dns_result.get("spf", {}).get("skipped"):
+        deduct(5, "Missing SPF record")
+    if not dns_result.get("dmarc", {}).get("present") and not dns_result.get("dmarc", {}).get("skipped"):
+        deduct(5, "Missing DMARC record")
+
+    cves = all_results.get("cves", [])
+    critical_cves = [c for c in cves if c.get("cvss_score", 0) >= 9.0]
+    high_cves = [c for c in cves if 7.0 <= c.get("cvss_score", 0) < 9.0]
+    if critical_cves:
+        deduct(25, f"{len(critical_cves)} Critical CVE(s)")
+    elif high_cves:
+        deduct(12, f"{len(high_cves)} High CVE(s)")
+
+    cors_issues = all_results.get("cors", {}).get("issues", [])
+    if any(i.get("severity") == "Critical" for i in cors_issues):
+        deduct(20, "Critical CORS misconfiguration")
+    elif cors_issues:
+        deduct(10, "CORS misconfiguration")
+
+    if all_results.get("ssh_banner", {}).get("eol"):
+        deduct(20, "End-of-life operating system")
+
+    score = max(0, score)
+    return score, compute_grade(score), deductions
+
+
+def build_remediation_roadmap(findings: list[dict[str, Any]]) -> dict[str, Any]:
+    order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Info": 4}
+    sorted_findings = sorted(findings, key=lambda f: order.get(f.get("severity", "Info"), 4))
+    immediate: list[dict[str, str]] = []
+    short_term: list[dict[str, str]] = []
+    long_term: list[dict[str, str]] = []
+
+    for finding in sorted_findings:
+        item = {
+            "title": finding.get("title", "Unknown"),
+            "recommendation": finding.get("recommendation") or finding.get("remediation") or "No recommendation.",
+            "severity": finding.get("severity", "Info"),
+        }
+        severity = finding.get("severity", "Info")
+        if severity in ("Critical", "High"):
+            immediate.append(item)
+        elif severity == "Medium":
+            short_term.append(item)
+        else:
+            long_term.append(item)
+
+    return {
+        "immediate_7_days": immediate,
+        "short_term_30_days": short_term,
+        "long_term_90_days": long_term,
+        "total_actions": len(findings),
+    }
+
+
+def _summary(findings: list[dict[str, Any]]) -> dict[str, int]:
+    result = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for finding in findings:
+        key = str(finding.get("severity", "Info")).lower()
+        if key in result:
+            result[key] += 1
+    return result
+
+
+def _critical_findings(findings: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"[{f.get('severity')}] {f.get('title', 'Unknown')}: {f.get('description', '')[:140]}"
+        for f in findings
+        if f.get("severity") in ("Critical", "High")
+    ]
+
+
+async def run_deep_scan(raw_target: str, quick: bool = True) -> dict[str, Any]:
+    start = time.time()
+    target = clean_target(raw_target)
+    is_ip = is_ip_address(target)
+
+    try:
+        ip_address = await asyncio.to_thread(socket.gethostbyname, target)
+    except Exception:
+        ip_address = None
+
+    http_url = f"http://{target}"
+    https_url = f"https://{target}"
+    port_target = ip_address or target
+
+    dns_r, port_r, http_r, https_r, whois_r, tech_http_r, tech_https_r, cors_r = await asyncio.gather(
+        dns_scan(target, is_ip=is_ip),
+        port_scan(port_target, quick=quick),
+        http_headers_scan(http_url),
+        http_headers_scan(https_url),
+        whois_scan(target, is_ip=is_ip),
+        tech_fingerprint(http_url),
+        tech_fingerprint(https_url),
+        cors_check(http_url),
+    )
+
+    headers_r = https_r if https_r.get("status") == "completed" else http_r
+    tech_r = tech_https_r if tech_https_r.get("status") == "completed" else tech_http_r
+
+    port_nums = [p.get("port") for p in port_r.get("open_ports", [])]
+    if 443 in port_nums:
+        ssl_r = await tls_deep_check(target)
+    else:
+        ssl_r = {
+            "status": "error",
+            "module": "ssl",
+            "reason": "Port 443 not open",
+            "protocols": {},
+            "cipher": None,
+            "cert": {},
+            "issues": [
+                _finding(
+                    "High",
+                    "No HTTPS/SSL Detected",
+                    "Port 443 is not open. Encrypted HTTPS service was not observed.",
+                    "Install an SSL certificate and serve HTTPS. Let's Encrypt with certbot is a practical starting point.",
+                    evidence="TCP/443 was not open in the port scan",
+                    category="tls",
+                    detection_method="TCP connect scan",
+                )
+            ],
+            "findings": [],
+        }
+        ssl_r["findings"] = ssl_r["issues"]
+
+    ssh_banner: dict[str, Any] = {}
+    for port in port_r.get("open_ports", []):
+        if port.get("port") == 22 and port.get("banner"):
+            ssh_banner = parse_ssh_banner(port["banner"])
+            break
+
+    cve_tasks = []
+    server_header = headers_r.get("headers_raw", {}).get("server") or headers_r.get("headers_raw", {}).get("Server", "")
+    if "Apache/" in server_header:
+        version = server_header.split("Apache/")[1].split(" ")[0]
+        cve_tasks.append(fetch_cves("Apache HTTP Server", version))
+    if ssh_banner.get("software") == "OpenSSH" and ssh_banner.get("version"):
+        cve_tasks.append(fetch_cves("OpenSSH", ssh_banner["version"]))
+    for tech in tech_r.get("technologies", []):
+        if tech.get("name") not in ("Web Server", "X-Powered-By") and tech.get("version"):
+            cve_tasks.append(fetch_cves(tech["name"], tech["version"]))
+
+    cves: list[dict[str, Any]] = []
+    if cve_tasks:
+        cve_batches = await asyncio.gather(*cve_tasks, return_exceptions=True)
+        for batch in cve_batches:
+            if isinstance(batch, list):
+                cves.extend(batch)
+
+    seen: set[str] = set()
+    unique_cves = []
+    for cve in cves:
+        cve_id = cve.get("cve_id")
+        if cve_id and cve_id not in seen:
+            seen.add(cve_id)
+            unique_cves.append(cve)
+
+    all_findings: list[dict[str, Any]] = []
+    all_findings.extend(headers_r.get("findings", []))
+    all_findings.extend(ssl_r.get("issues", []))
+    all_findings.extend(cors_r.get("issues", []))
+    all_findings.extend(dns_r.get("findings", []))
+    all_findings.extend(port_r.get("findings", []))
+
+    if ssh_banner.get("eol"):
+        all_findings.append(
+            _finding(
+                "Critical",
+                f"End-of-Life OS Detected: {ssh_banner.get('os', 'Unknown')}",
+                "This OS no longer receives security patches. Vulnerabilities discovered after EOL are permanently unpatched.",
+                "Upgrade to Ubuntu 22.04 LTS or 24.04 LTS. Plan migration within 30 days.",
+                evidence=ssh_banner.get("raw", ""),
+                confidence=90,
+                category="infrastructure",
+                detection_method="SSH banner parsing",
+            )
+        )
+
+    for cve in unique_cves:
+        cvss = cve.get("cvss_score", 0)
+        severity = "Critical" if cvss >= 9.0 else ("High" if cvss >= 7.0 else "Medium")
+        all_findings.append(
+            _finding(
+                severity,
+                f"{cve.get('cve_id')} - CVSS {cvss}",
+                cve.get("description", ""),
+                f"Apply the vendor patch or mitigation. See: {cve.get('url')}",
+                evidence="Detected software version matched NVD CVE database",
+                confidence=80,
+                category="cve",
+                detection_method="NIST NVD keyword cross-reference",
+            )
+        )
+
+    all_scan_data = {
+        "ssl": ssl_r,
+        "headers": headers_r,
+        "ports": port_r,
+        "dns": dns_r,
+        "cves": unique_cves,
+        "cors": cors_r,
+        "ssh_banner": ssh_banner,
+    }
+    score, grade, deductions = calculate_security_score(all_scan_data)
+    summary = _summary(all_findings)
+    timestamp = datetime.utcnow()
+
+    web_server = server_header or tech_r.get("server")
+    technologies = {
+        "status": tech_r.get("status", "completed"),
+        "web_server": web_server,
+        "backend_framework": tech_r.get("x_powered_by"),
+        "technologies": tech_r.get("technologies", []),
+        "waf_detected": False,
+        "waf_name": None,
+    }
+
+    result = {
+        "target": target,
+        "raw_target": raw_target,
+        "clean_target": target,
+        "ip_address": ip_address,
+        "resolved_ip": ip_address,
+        "quick_scan": quick,
+        "scan_timestamp": timestamp.isoformat(),
+        "scan_duration_ms": int((time.time() - start) * 1000),
+        "score": score,
+        "grade": grade,
+        "score_deductions": deductions,
+        "summary": summary,
+        "severity_counts": summary,
+        "findings": all_findings,
+        "critical_findings": _critical_findings(all_findings),
+        "total_findings": len(all_findings),
+        "dns": dns_r,
+        "ssl": ssl_r,
+        "headers": headers_r,
+        "http_headers": headers_r,
+        "ports": port_r,
+        "technologies": technologies,
+        "cves": unique_cves,
+        "cve_scan": {"status": "completed", "findings": [f for f in all_findings if f.get("category") == "cve"]},
+        "cors": cors_r,
+        "ssh_banner": ssh_banner,
+        "whois": whois_r,
+        "remediation_roadmap": build_remediation_roadmap(all_findings),
+        "trust_boundary": (
+            f"Non-intrusive passive reconnaissance only. Collected "
+            f"{timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC. "
+            "No credentials tested. No payloads injected. Findings are observations; "
+            "exploitability is not claimed unless explicit evidence exists."
+        ),
+    }
+
+    # Backward-compatible aliases for the current Next.js UI and history store.
+    result["overall_risk_score"] = score
+    result["risk_grade"] = grade
+    return result
+
+
+def run_scan_sync(target: str, quick: bool = True) -> dict[str, Any]:
+    return asyncio.run(run_deep_scan(target, quick=quick))
 
 
 class DeepScanner:
-    """Backward-compatibility wrapper."""
+    """Backward-compatible wrapper used by older call sites."""
 
-    async def scan(self, target: str, quick: bool = True) -> dict:
-        return await run_deep_scan(target, quick)
+    async def scan(self, target: str, quick: bool = True) -> dict[str, Any]:
+        return await run_deep_scan(target, quick=quick)
+
