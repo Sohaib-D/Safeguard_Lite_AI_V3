@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { authAPI } from "../../lib/api";
 import { useAppStore } from "../../store/useAppStore";
 import { getRole } from "../../lib/auth";
-import { Shield, Lock, User, AlertCircle, CheckCircle2 } from "lucide-react";
+import { Shield, Lock, User, AlertCircle, CheckCircle2, Loader2 } from "lucide-react";
 import { cn } from "../../lib/utils";
 
 export function LoginForm() {
@@ -33,8 +33,13 @@ export function LoginForm() {
       setAuth(res.access_token, res.username || data.username, role);
       router.push("/app/home");
     } catch (err: any) {
-      console.error(err);
-      setError("Backend loading? Wait 1 minute and retry. Or invalid credentials.");
+      if (err.response?.status === 401) {
+        setError("Wrong username or password.");
+      } else if (!err.response) {
+        setError("Backend is waking up... Please wait 30 seconds and try again.");
+      } else {
+        setError(err.response?.data?.detail || "Sign in failed.");
+      }
     } finally {
       setIsLoading(false);
     }
@@ -52,8 +57,11 @@ export function LoginForm() {
       setSuccess("Account created successfully. Please sign in.");
       setActiveTab("signin");
     } catch (err: any) {
-      console.error(err);
-      setError(err.response?.data?.detail || "Registration failed.");
+      if (!err.response) {
+        setError("Backend is waking up... Please wait 30 seconds and try again.");
+      } else {
+        setError(err.response?.data?.detail || "Registration failed.");
+      }
     } finally {
       setIsLoading(false);
     }
@@ -136,9 +144,16 @@ export function LoginForm() {
             <button
               type="submit"
               disabled={isLoading}
-              className="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-sm font-medium text-bg-primary bg-accent-cyan hover:bg-accent-cyan/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-accent-cyan disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[48px]"
+              className="w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-sm font-medium text-bg-primary bg-accent-cyan hover:bg-accent-cyan/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-accent-cyan disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[48px]"
             >
-              {isLoading ? "Signing in..." : "Sign In"}
+              {isLoading ? (
+                <>
+                  <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                  Waking up Backend...
+                </>
+              ) : (
+                "Sign In"
+              )}
             </button>
           </form>
         ) : (
@@ -180,9 +195,16 @@ export function LoginForm() {
             <button
               type="submit"
               disabled={isLoading}
-              className="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-sm font-medium text-bg-primary bg-accent-violet hover:bg-accent-violet/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-accent-violet disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[48px]"
+              className="w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-xl shadow-sm text-sm font-medium text-bg-primary bg-accent-violet hover:bg-accent-violet/90 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-accent-violet disabled:opacity-50 disabled:cursor-not-allowed transition-colors min-h-[48px]"
             >
-              {isLoading ? "Creating Account..." : "Create Account"}
+              {isLoading ? (
+                <>
+                  <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                  Waking up Backend...
+                </>
+              ) : (
+                "Create Account"
+              )}
             </button>
 
             <div className="mt-4 p-4 bg-bg-tertiary rounded-xl border border-border-subtle">
